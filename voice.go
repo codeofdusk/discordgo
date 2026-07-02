@@ -102,6 +102,11 @@ type VoiceConnection struct {
 	voiceSpeakingUpdateHandlers []VoiceSpeakingUpdateHandler
 
 	seqAck int // for heartbeat and resume
+
+	// pumpsStarted records whether opusSender/opusReceiver are running for
+	// the current websocket attempt; reset when a new attempt begins so a
+	// repeated session description cannot double-start them.
+	pumpsStarted bool
 }
 
 // DeadChannel exposes the close notification channel for callers that need a
@@ -259,11 +264,13 @@ type VoiceSpeakingUpdate struct {
 func (v *VoiceConnection) failure(err error) {
 	v.log(LogError, "voice unrecoverable error, %v", err.Error())
 	v.log(LogDebug, "voice struct: %#v\n", v)
+	// Record the error but leave the Dead transition to Kill: it owns
+	// closing v.dead and the Opus channels, and setting Status here would
+	// make Kill skip that work, leaving Dead-channel waiters and Opus
+	// consumers hanging on a connection that has already failed.
 	v.Cond.L.Lock()
 	if v.Err == nil {
-		v.Status = VoiceConnectionStatusDead
 		v.Err = err
-		v.Cond.Broadcast()
 	}
 	v.Cond.L.Unlock()
 	// cleanup
@@ -305,30 +312,37 @@ type voiceOP8 struct {
 func (v *VoiceConnection) waitUntilStatus(ctx context.Context, status VoiceConnectionStatus) error {
 	v.log(LogInformational, "called")
 
-	ch := make(chan error)
+	// Buffered so the Cond waiter's send can never block while it holds
+	// Cond.L: an unbuffered send there would wedge the connection's lock
+	// forever once the caller had already returned on ctx expiry.
+	done := make(chan error, 1)
+
+	// Wake the Cond waiter when the context expires so it observes
+	// ctx.Err() instead of sleeping until an unrelated Broadcast.
+	stopWake := make(chan struct{})
+	defer close(stopWake)
+	go func() {
+		select {
+		case <-ctx.Done():
+			v.Cond.Broadcast()
+		case <-stopWake:
+		}
+	}()
 
 	go func() {
-		defer close(ch)
 		v.Cond.L.Lock()
 		defer v.Cond.L.Unlock()
 		for v.Status != status && v.Status != VoiceConnectionStatusDead {
-			select {
-			case <-ctx.Done():
+			if ctx.Err() != nil {
+				done <- ctx.Err()
 				return
-			default:
 			}
 			v.Cond.Wait()
 		}
-		ch <- v.Err
+		done <- v.Err
 	}()
 
-	select {
-	case err := <-ch:
-		return err
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-
+	return <-done
 }
 
 // onVoiceServerUpdate handles a VOICE_SERVER_UPDATE event of main gateway.
@@ -363,6 +377,10 @@ var ErrVoiceReconnectionLimit = errors.New("reconnection limit reached")
 
 // ErrVoiceUnknownEncryptionMode means Discord requested encryption mode which is not supported
 var ErrVoiceUnknownEncryptionMode = errors.New("unknown encryption mode")
+
+// voiceResumeReadyTimeout bounds how long a resumed voice websocket may sit
+// without a fresh session description before the connection is failed.
+const voiceResumeReadyTimeout = 10 * time.Second
 
 // websocket open the voice websocket, handle reconnect, and listens on it for messages and passes them to the voice event handler.
 // This is automatically called by the Open func.
@@ -420,6 +438,10 @@ func (v *VoiceConnection) websocket(ctx context.Context, endpoint string, token 
 
 		v.Cond.L.Lock()
 		v.Status = VoiceConnectionStatusConnecting
+		// A fresh attempt gets fresh Opus pumps: the previous attempt's
+		// pumps die with its context, and the next session description
+		// must be able to start replacements exactly once.
+		v.pumpsStarted = false
 		v.Cond.Broadcast()
 		v.Cond.L.Unlock()
 
@@ -427,6 +449,18 @@ func (v *VoiceConnection) websocket(ctx context.Context, endpoint string, token 
 		v.log(LogInformational, "connecting to voice endpoint %s", vg)
 		wsConn, _, err := v.session.Dialer.Dial(vg, nil)
 		if err != nil {
+			if i > 0 {
+				// A reconnect dial can hit a voice server that is briefly
+				// unreachable (restart, failover); burn a retry slot
+				// instead of declaring the connection dead on one miss.
+				v.log(LogWarning, "error connecting to voice endpoint %s, retrying, %v", vg, err)
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(1 * time.Second):
+				}
+				continue
+			}
 			err = fmt.Errorf("error connecting to voice endpoint %s, %w", vg, err)
 			v.failure(err)
 			return
@@ -515,6 +549,24 @@ func (v *VoiceConnection) websocket(ctx context.Context, endpoint string, token 
 				v.failure(err)
 				return
 			}
+
+			// The resumed session only becomes usable once Discord answers
+			// the select_protocol re-sent by udpOpen with a fresh session
+			// description (op4), which restarts the Opus pumps and flips
+			// the status back to Ready. If that answer never comes, the
+			// connection would otherwise sit in Connecting forever with
+			// dead audio; bound the wait and fail cleanly instead.
+			go func(ctx context.Context) {
+				wctx, wcancel := context.WithTimeout(ctx, voiceResumeReadyTimeout)
+				defer wcancel()
+				err := v.waitUntilStatus(wctx, VoiceConnectionStatusReady)
+				// Only the watchdog's own deadline means the resume is
+				// stuck: nil is Ready, Canceled is a superseding attempt,
+				// and anything else means the connection already failed.
+				if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+					v.failure(fmt.Errorf("voice resume did not restore a ready session: %w", err))
+				}
+			}(ctx)
 		}
 
 		for {
@@ -688,17 +740,24 @@ func (v *VoiceConnection) onEvent(ctx context.Context, binary bool, message []by
 				}
 			}
 
-			if v.OpusSend == nil {
-				v.OpusSend = make(chan []byte, 16)
-			}
-			go v.opusSender(ctx, 48000, 960)
+			// A session description can arrive more than once per attempt
+			// (e.g. a rekey); the pumps must only be started for the first
+			// one, or two senders would interleave on the same channel.
+			if !v.pumpsStarted {
+				v.pumpsStarted = true
 
-			if !v.deaf {
-				if v.OpusRecv == nil {
-					v.OpusRecv = make(chan *Packet, 2)
+				if v.OpusSend == nil {
+					v.OpusSend = make(chan []byte, 16)
 				}
+				go v.opusSender(ctx, 48000, 960)
 
-				go v.opusReceiver(ctx)
+				if !v.deaf {
+					if v.OpusRecv == nil {
+						v.OpusRecv = make(chan *Packet, 2)
+					}
+
+					go v.opusReceiver(ctx)
+				}
 			}
 
 			v.Status = VoiceConnectionStatusReady
@@ -926,11 +985,14 @@ func (v *VoiceConnection) udpOpen(ctx context.Context) (err error) {
 		return fmt.Errorf("received udp packet too small")
 	}
 
-	// Loop over position 8 through 71 to grab the IP address.
+	// Loop over position 8 through 71 to grab the IP address. The address
+	// field is null-terminated and zero-padded, so stop at the first NUL:
+	// scanning on would fold the padding into the address string.
 	var ip string
 	for i := 8; i < len(rb)-2; i++ {
 		if rb[i] == 0 {
 			ip = string(rb[8:i])
+			break
 		}
 	}
 
