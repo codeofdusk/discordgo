@@ -140,6 +140,12 @@ func (v *VoiceConnection) Speaking(b bool) (err error) {
 		Data voiceSpeakingData `json:"d"`
 	}
 
+	// Tolerate a zero-value VoiceConnection (Cond is only set once a join
+	// runs), like the pre-rewrite embedded-mutex version did.
+	if v.Cond == nil {
+		return fmt.Errorf("no VoiceConnection websocket")
+	}
+
 	v.Cond.L.Lock()
 	defer v.Cond.L.Unlock()
 	if v.wsConn == nil {
