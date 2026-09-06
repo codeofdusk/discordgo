@@ -12,6 +12,7 @@
 package discordgo
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -120,6 +121,11 @@ type Session struct {
 
 	// When nil, the session is not listening.
 	listening chan interface{}
+
+	// A generation survives automatic reconnects but ends on explicit Close
+	// or Open. The session lock guards replacement and cancellation.
+	gatewayContext context.Context
+	gatewayCancel  context.CancelFunc
 
 	// sequence tracks the current gateway api websocket sequence number
 	sequence *int64
