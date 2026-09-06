@@ -1348,7 +1348,11 @@ func (v *VoiceConnection) handleDAVEBinary(message []byte) {
 		v.log(LogInformational, "DAVE encryption prepared after Welcome")
 		v.log(LogInformational, "DAVE initial transition activated after Welcome canEncrypt=%v", dave.CanEncrypt())
 
+		// Synchronize notification with readiness checks, after DAVE has
+		// released its own lock, so a waiter cannot miss this transition.
+		v.Cond.L.Lock()
 		v.Cond.Broadcast()
+		v.Cond.L.Unlock()
 
 		v.sendDAVEReadyForTransition(transitionID)
 
@@ -1400,9 +1404,8 @@ func (v *VoiceConnection) handleDAVEExecuteTransition(data json.RawMessage) {
 		}
 		v.log(LogInformational, "DAVE execute_transition id=%d canEncrypt=%v", msg.TransitionID, dave.CanEncrypt())
 
-		v.Cond.Broadcast()
-
 		v.Cond.L.Lock()
+		v.Cond.Broadcast()
 		pending := v.pendingReWelcome
 		v.pendingReWelcome = false
 		v.Cond.L.Unlock()

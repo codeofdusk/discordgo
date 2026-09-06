@@ -5,6 +5,8 @@ import (
 	"errors"
 	"runtime"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -121,5 +123,103 @@ func TestVoiceStatusWaitCancellation(t *testing.T) {
 		case <-time.After(time.Second):
 			t.Fatal("status wait missed context cancellation")
 		}
+	}
+}
+
+// Pause the transition after it snapshots dave, then observe its next lock
+// attempt. This places activation between a readiness check and Cond.Wait.
+type daveTransitionTestLocker struct {
+	mu              sync.Mutex
+	locks           atomic.Int32
+	firstUnlock     atomic.Bool
+	snapshot        chan struct{}
+	allowTransition chan struct{}
+	notification    chan struct{}
+}
+
+func (l *daveTransitionTestLocker) Lock() {
+	if l.locks.Add(1) == 3 {
+		close(l.notification)
+	}
+	l.mu.Lock()
+}
+
+func (l *daveTransitionTestLocker) Unlock() {
+	l.mu.Unlock()
+	if l.firstUnlock.CompareAndSwap(false, true) {
+		close(l.snapshot)
+		<-l.allowTransition
+	}
+}
+
+func TestDAVETransitionCannotMissReadinessWait(t *testing.T) {
+	s := &Session{LogLevel: -1, VoiceConnections: make(map[string]*VoiceConnection)}
+	voice := newWebsocketTestVoice(s)
+	voice.dave = &DAVESession{
+		senderKey:           []byte{1, 2, 3},
+		frameCipher:         testAEAD{},
+		pendingTransitionID: 1,
+	}
+	voice.pendingReWelcome = true
+	locker := &daveTransitionTestLocker{
+		snapshot:        make(chan struct{}),
+		allowTransition: make(chan struct{}),
+		notification:    make(chan struct{}),
+	}
+	voice.Cond = sync.NewCond(locker)
+	var transitionOnce, waiterOnce sync.Once
+	allowWait := make(chan struct{})
+	releaseTransition := func() { transitionOnce.Do(func() { close(locker.allowTransition) }) }
+	releaseWaiter := func() { waiterOnce.Do(func() { close(allowWait) }) }
+	t.Cleanup(releaseTransition)
+	t.Cleanup(releaseWaiter)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	transitionDone := make(chan struct{})
+	go func() {
+		defer close(transitionDone)
+		voice.handleDAVEExecuteTransition([]byte(`{"transition_id":2}`))
+	}()
+	select {
+	case <-locker.snapshot:
+	case <-ctx.Done():
+		t.Fatal("transition did not snapshot its DAVE session")
+	}
+	checked := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- voice.waitFor(ctx, func() bool {
+			ready := voice.dave.CanEncrypt()
+			if !ready {
+				close(checked)
+				<-allowWait
+			}
+			return ready
+		})
+	}()
+	select {
+	case <-checked:
+	case <-ctx.Done():
+		t.Fatal("waiter did not check readiness before activation")
+	}
+	releaseTransition()
+	select {
+	case <-locker.notification:
+	case <-ctx.Done():
+		t.Fatal("transition did not attempt to notify its readiness waiter")
+	}
+	releaseWaiter()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("waiter missed successful DAVE activation: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("waiter missed successful DAVE activation")
+	}
+	select {
+	case <-transitionDone:
+	case <-ctx.Done():
+		t.Fatal("transition did not finish after notifying the waiter")
 	}
 }
