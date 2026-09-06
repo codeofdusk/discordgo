@@ -1,6 +1,7 @@
 package discordgo
 
 import (
+	"context"
 	"math"
 	"net/http"
 	"strconv"
@@ -89,10 +90,10 @@ func (r *RateLimiter) newBucket(key string) *Bucket {
 	return b
 }
 
-// lockTransientBucket retains short-lived endpoint state until all users finish
+// leaseTransientBucket retains short-lived endpoint state until all users finish
 // and both the idle period and server's reset time have passed. Ordinary API
 // buckets retain their existing lifetime. Pruning needs no background worker.
-func (r *RateLimiter) lockTransientBucket(key string) (*Bucket, func()) {
+func (r *RateLimiter) leaseTransientBucket(key string) (*Bucket, func()) {
 	r.Lock()
 	now := r.now()
 	if !now.Before(r.nextTransientPrune) {
@@ -125,7 +126,12 @@ func (r *RateLimiter) lockTransientBucket(key string) (*Bucket, func()) {
 			entry.expires = entry.bucket.reset
 		}
 	}
-	return r.LockBucketObject(entry.bucket), release
+	return entry.bucket, release
+}
+
+func (r *RateLimiter) lockTransientBucket(key string) (*Bucket, func()) {
+	bucket, release := r.leaseTransientBucket(key)
+	return r.LockBucketObject(bucket), release
 }
 
 // GetWaitTime returns the duration you should wait for a Bucket
@@ -152,14 +158,56 @@ func (r *RateLimiter) LockBucket(bucketID string) *Bucket {
 
 // LockBucketObject Locks an already resolved bucket until a request can be made
 func (r *RateLimiter) LockBucketObject(b *Bucket) *Bucket {
-	b.Lock()
+	_ = r.lockBucketObject(context.Background(), b)
+	return b
+}
 
-	if wait := r.GetWaitTime(b, 1); wait > 0 {
-		time.Sleep(wait)
+func (r *RateLimiter) lockBucketObject(ctx context.Context, b *Bucket) error {
+	if ctx.Done() == nil {
+		b.Lock()
+	} else {
+		// Callers can hold the exported mutex directly. Polling preserves that
+		// contract without leaving a goroutine waiting after cancellation.
+		for !b.TryLock() {
+			if err := waitForRateLimit(ctx, 10*time.Millisecond); err != nil {
+				return err
+			}
+		}
 	}
 
+	for {
+		if err := ctx.Err(); err != nil {
+			b.Unlock()
+			return err
+		}
+		wait := r.GetWaitTime(b, 1)
+		if wait <= 0 {
+			break
+		}
+		if err := waitForRateLimit(ctx, wait); err != nil {
+			b.Unlock()
+			return err
+		}
+	}
 	b.Remaining--
-	return b
+	return nil
+}
+
+func waitForRateLimit(ctx context.Context, delay time.Duration) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if delay <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return ctx.Err()
+	}
 }
 
 // Bucket represents a ratelimit bucket, each bucket gets ratelimited individually (-global ratelimits)

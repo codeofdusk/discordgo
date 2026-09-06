@@ -83,7 +83,7 @@ func (r RESTError) Error() string {
 }
 
 // RateLimitError is returned when a request exceeds a rate limit
-// and ShouldRetryOnRateLimit is false. The request may be manually
+// and retries are disabled or exhausted. The request may be manually
 // retried after waiting the duration specified by RetryAfter.
 type RateLimitError struct {
 	*RateLimit
@@ -116,7 +116,7 @@ func newRequestConfig(s *Session, req *http.Request) *RequestConfig {
 // It can be supplied as an argument to any REST method.
 type RequestOption func(cfg *RequestConfig)
 
-// WithClient changes the HTTP client used for the request.
+// WithClient changes the HTTP client and overall timeout used for the request.
 func WithClient(client *http.Client) RequestOption {
 	return func(cfg *RequestConfig) {
 		if client != nil {
@@ -132,7 +132,7 @@ func WithRetryOnRatelimit(retry bool) RequestOption {
 	}
 }
 
-// WithRestRetries changes maximum amount of retries if request fails.
+// WithRestRetries changes the maximum retries shared by server errors and rate limits.
 func WithRestRetries(max int) RequestOption {
 	return func(cfg *RequestConfig) {
 		cfg.MaxRestRetries = max
@@ -156,7 +156,7 @@ func WithLocale(locale Locale) RequestOption {
 	return WithHeader("X-Discord-Locale", string(locale))
 }
 
-// WithContext changes context of the request.
+// WithContext changes the context of the request, including rate-limit waits.
 func WithContext(ctx context.Context) RequestOption {
 	return func(cfg *RequestConfig) {
 		cfg.Request = cfg.Request.WithContext(ctx)
@@ -183,17 +183,25 @@ func (s *Session) RequestWithBucketID(method, urlStr string, data interface{}, b
 
 // RequestRaw makes a (GET/POST/...) Requests to Discord REST API.
 // Preferably use the other Request* methods but this lets you send JSON directly if that's what you have.
-// Sequence is the sequence number, if it fails with a 502 it will
-// retry with sequence+1 until it either succeeds or sequence >= session.MaxRestRetries
+// Sequence counts retries for server errors and rate limits against MaxRestRetries.
 func (s *Session) RequestRaw(method, urlStr, contentType string, b []byte, bucketID string, sequence int, options ...RequestOption) (response []byte, err error) {
 	if bucketID == "" {
 		bucketID = strings.SplitN(urlStr, "?", 2)[0]
 	}
-	return s.RequestWithLockedBucket(method, urlStr, contentType, b, s.Ratelimiter.LockBucket(bucketID), sequence, options...)
+	return s.requestWithBucket(method, urlStr, contentType, b, s.Ratelimiter.GetBucket(bucketID), false, sequence, options...)
 }
 
 // RequestWithLockedBucket makes a request using a bucket that's already been locked
 func (s *Session) RequestWithLockedBucket(method, urlStr, contentType string, b []byte, bucket *Bucket, sequence int, options ...RequestOption) (response []byte, err error) {
+	return s.requestWithBucket(method, urlStr, contentType, b, bucket, true, sequence, options...)
+}
+
+func (s *Session) requestWithBucket(method, urlStr, contentType string, b []byte, bucket *Bucket, locked bool, sequence int, options ...RequestOption) (response []byte, err error) {
+	defer func() {
+		if locked {
+			_ = bucket.Release(nil)
+		}
+	}()
 	if s.Debug {
 		log.Printf("API REQUEST %8s :: %s\n", method, urlStr)
 		log.Printf("API REQUEST  PAYLOAD :: [%s]\n", string(b))
@@ -201,7 +209,6 @@ func (s *Session) RequestWithLockedBucket(method, urlStr, contentType string, b 
 
 	req, err := http.NewRequest(method, urlStr, bytes.NewBuffer(b))
 	if err != nil {
-		bucket.Release(nil)
 		return
 	}
 
@@ -225,6 +232,16 @@ func (s *Session) RequestWithLockedBucket(method, urlStr, contentType string, b 
 		opt(cfg)
 	}
 	req = cfg.Request
+	// Bound the complete operation, including bucket waits and retries, by the
+	// effective client's timeout. Clients without a timeout use the session's
+	// default of 20 seconds; an earlier caller deadline still takes precedence.
+	timeout := cfg.Client.Timeout
+	if timeout <= 0 {
+		timeout = 20 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(req.Context(), timeout)
+	defer cancel()
+	req = req.WithContext(ctx)
 
 	if s.Debug {
 		for k, v := range req.Header {
@@ -232,87 +249,85 @@ func (s *Session) RequestWithLockedBucket(method, urlStr, contentType string, b 
 		}
 	}
 
-	resp, err := cfg.Client.Do(req)
-	if err != nil {
-		bucket.Release(nil)
-		return
-	}
-	defer func() {
-		err2 := resp.Body.Close()
-		if s.Debug && err2 != nil {
+	for {
+		if !locked {
+			if err = s.Ratelimiter.lockBucketObject(ctx, bucket); err != nil {
+				if req.Body != nil {
+					_ = req.Body.Close()
+				}
+				return
+			}
+			locked = true
+		}
+		resp, requestErr := cfg.Client.Do(req)
+		if requestErr != nil {
+			return nil, requestErr
+		}
+		err = bucket.Release(resp.Header)
+		locked = false
+		if err == nil {
+			response, err = ioutil.ReadAll(resp.Body)
+		}
+		// Close each response before retrying so earlier attempts do not retain
+		// bodies and transport resources throughout a rate-limit wait.
+		closeErr := resp.Body.Close()
+		if s.Debug && closeErr != nil {
 			log.Println("error closing resp body")
 		}
-	}()
-
-	err = bucket.Release(resp.Header)
-	if err != nil {
-		return
-	}
-
-	response, err = ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return
-	}
-
-	if s.Debug {
-
-		log.Printf("API RESPONSE  STATUS :: %s\n", resp.Status)
-		for k, v := range resp.Header {
-			log.Printf("API RESPONSE  HEADER :: [%s] = %+v\n", k, v)
-		}
-		log.Printf("API RESPONSE    BODY :: [%s]\n\n\n", response)
-	}
-
-	switch resp.StatusCode {
-	case http.StatusOK:
-	case http.StatusCreated:
-	case http.StatusNoContent:
-	case http.StatusInternalServerError:
-		fallthrough
-	case http.StatusServiceUnavailable:
-		fallthrough
-	case http.StatusGatewayTimeout:
-		fallthrough
-	case http.StatusBadGateway:
-		// Retry sending request if possible
-		if sequence < cfg.MaxRestRetries {
-
-			s.log(LogInformational, "%s Failed (%s), Retrying...", urlStr, resp.Status)
-			response, err = s.RequestWithLockedBucket(method, urlStr, contentType, b, s.Ratelimiter.LockBucketObject(bucket), sequence+1, options...)
-		} else {
-			err = fmt.Errorf("Exceeded Max retries HTTP %s, %s", resp.Status, response)
-		}
-	case http.StatusTooManyRequests:
-		rl := TooManyRequests{}
-		err = Unmarshal(response, &rl)
 		if err != nil {
-			s.log(LogError, "rate limit unmarshal error, %s", err)
 			return
 		}
 
-		if cfg.ShouldRetryOnRateLimit {
+		if s.Debug {
+			log.Printf("API RESPONSE  STATUS :: %s\n", resp.Status)
+			for k, v := range resp.Header {
+				log.Printf("API RESPONSE  HEADER :: [%s] = %+v\n", k, v)
+			}
+			log.Printf("API RESPONSE    BODY :: [%s]\n\n\n", response)
+		}
+
+		switch resp.StatusCode {
+		case http.StatusOK, http.StatusCreated, http.StatusNoContent:
+			return response, nil
+		case http.StatusInternalServerError, http.StatusServiceUnavailable, http.StatusGatewayTimeout, http.StatusBadGateway:
+			if sequence >= cfg.MaxRestRetries {
+				return response, fmt.Errorf("Exceeded Max retries HTTP %s, %s", resp.Status, response)
+			}
+			s.log(LogInformational, "%s Failed (%s), Retrying...", urlStr, resp.Status)
+		case http.StatusTooManyRequests:
+			rl := TooManyRequests{}
+			if err = Unmarshal(response, &rl); err != nil {
+				s.log(LogError, "rate limit unmarshal error, %s", err)
+				return
+			}
+			if !cfg.ShouldRetryOnRateLimit || sequence >= cfg.MaxRestRetries {
+				return response, &RateLimitError{&RateLimit{TooManyRequests: &rl, URL: urlStr}}
+			}
 			s.log(LogInformational, "Rate Limiting %s, retry in %v", urlStr, rl.RetryAfter)
 			s.handleEvent(rateLimitEventType, &RateLimit{TooManyRequests: &rl, URL: urlStr})
-
-			time.Sleep(rl.RetryAfter)
-			// we can make the above smarter
-			// this method can cause longer delays than required
-
-			response, err = s.RequestWithLockedBucket(method, urlStr, contentType, b, s.Ratelimiter.LockBucketObject(bucket), sequence, options...)
-		} else {
-			err = &RateLimitError{&RateLimit{TooManyRequests: &rl, URL: urlStr}}
+			if err = waitForRateLimit(ctx, rl.RetryAfter); err != nil {
+				return
+			}
+		case http.StatusUnauthorized:
+			if strings.Index(s.Token, "Bot ") != 0 {
+				s.log(LogInformational, ErrUnauthorized.Error())
+			}
+			fallthrough
+		default:
+			return response, newRestError(req, resp, response)
 		}
-	case http.StatusUnauthorized:
-		if strings.Index(s.Token, "Bot ") != 0 {
-			s.log(LogInformational, ErrUnauthorized.Error())
-			err = ErrUnauthorized
+
+		sequence++
+		req = req.Clone(ctx)
+		if req.Body != nil && req.Body != http.NoBody {
+			if req.GetBody == nil {
+				return response, errors.New("cannot retry a request with a non-replayable body")
+			}
+			if req.Body, err = req.GetBody(); err != nil {
+				return
+			}
 		}
-		fallthrough
-	default: // Error condition
-		err = newRestError(req, resp, response)
 	}
-
-	return
 }
 
 func unmarshal(data []byte, v interface{}) error {
@@ -3209,9 +3224,9 @@ func (s *Session) InteractionRespond(interaction *Interaction, resp *Interaction
 
 	// Each callback has a unique endpoint. Keep its bucket through concurrent
 	// requests and retries, but do not retain every interaction for the session.
-	bucket, release := s.Ratelimiter.lockTransientBucket(endpoint)
+	bucket, release := s.Ratelimiter.leaseTransientBucket(endpoint)
 	defer release()
-	_, err = s.RequestWithLockedBucket("POST", endpoint, contentType, body, bucket, 0, options...)
+	_, err = s.requestWithBucket("POST", endpoint, contentType, body, bucket, false, 0, options...)
 	return err
 }
 
