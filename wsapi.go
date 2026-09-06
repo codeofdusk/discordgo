@@ -91,13 +91,15 @@ func (s *Session) Open() error {
 	s.log(LogInformational, "connecting to gateway %s", gateway)
 	header := http.Header{}
 	header.Add("accept-encoding", "zlib")
-	s.wsConn, _, err = s.Dialer.Dial(gateway, header)
+	wsConn, _, err := s.Dialer.Dial(gateway, header)
 	if err != nil {
 		s.log(LogError, "error connecting to gateway %s, %s", s.gateway, err)
 		s.gateway = "" // clear cached gateway
-		s.wsConn = nil // Just to be safe.
 		return err
 	}
+	s.wsMutex.Lock()
+	s.wsConn = wsConn
+	s.wsMutex.Unlock()
 
 	s.wsConn.SetCloseHandler(func(code int, text string) error {
 		return nil
@@ -108,8 +110,10 @@ func (s *Session) Open() error {
 		// when exiting with an error :)  Maybe someone has a better
 		// way :)
 		if err != nil {
+			s.wsMutex.Lock()
 			s.wsConn.Close()
 			s.wsConn = nil
+			s.wsMutex.Unlock()
 		}
 	}()
 
@@ -156,9 +160,7 @@ func (s *Session) Open() error {
 		p.Data.Sequence = sequence
 
 		s.log(LogInformational, "sending resume packet to gateway")
-		s.wsMutex.Lock()
-		err = s.wsConn.WriteJSON(p)
-		s.wsMutex.Unlock()
+		err = s.writeGatewayJSON(context.Background(), p)
 		if err != nil {
 			err = fmt.Errorf("error sending gateway resume packet, %s, %s", s.gateway, err)
 			return err
@@ -311,10 +313,10 @@ func (s *Session) heartbeat(wsConn *websocket.Conn, listening <-chan interface{}
 		s.RUnlock()
 		sequence := atomic.LoadInt64(s.sequence)
 		s.log(LogDebug, "sending gateway websocket heartbeat seq %d", sequence)
-		s.wsMutex.Lock()
+		s.Lock()
 		s.LastHeartbeatSent = time.Now().UTC()
-		err = wsConn.WriteJSON(heartbeatOp{1, sequence})
-		s.wsMutex.Unlock()
+		s.Unlock()
+		err = writeWebsocketJSON(context.Background(), &s.wsMutex, wsConn, heartbeatOp{1, sequence})
 		if err != nil || time.Now().UTC().Sub(last) > (heartbeatIntervalMsec*FailedHeartbeatAcks) {
 			if err != nil {
 				s.log(LogError, "error sending heartbeat to gateway %s, %s", s.gateway, err)
@@ -447,9 +449,7 @@ func (s *Session) UpdateStatusComplex(usd UpdateStatusData) (err error) {
 		return ErrWSNotFound
 	}
 
-	s.wsMutex.Lock()
-	err = s.wsConn.WriteJSON(updateStatusOp{3, usd})
-	s.wsMutex.Unlock()
+	err = s.writeGatewayJSON(context.Background(), updateStatusOp{3, usd})
 
 	return
 }
@@ -541,9 +541,7 @@ func (s *Session) GatewayWriteStruct(data interface{}) (err error) {
 		return ErrWSNotFound
 	}
 
-	s.wsMutex.Lock()
-	err = s.wsConn.WriteJSON(data)
-	s.wsMutex.Unlock()
+	err = s.writeGatewayJSON(context.Background(), data)
 
 	return err
 }
@@ -557,9 +555,7 @@ func (s *Session) requestGuildMembers(data requestGuildMembersData) (err error) 
 		return ErrWSNotFound
 	}
 
-	s.wsMutex.Lock()
-	err = s.wsConn.WriteJSON(requestGuildMembersOp{8, data})
-	s.wsMutex.Unlock()
+	err = s.writeGatewayJSON(context.Background(), requestGuildMembersOp{8, data})
 
 	return
 }
@@ -611,9 +607,7 @@ func (s *Session) onEvent(messageType int, message []byte) (*Event, error) {
 	// Must respond with a heartbeat packet within 5 seconds
 	if e.Operation == 1 {
 		s.log(LogInformational, "sending heartbeat in response to Op1")
-		s.wsMutex.Lock()
-		err = s.wsConn.WriteJSON(heartbeatOp{1, atomic.LoadInt64(s.sequence)})
-		s.wsMutex.Unlock()
+		err = s.writeGatewayJSON(context.Background(), heartbeatOp{1, atomic.LoadInt64(s.sequence)})
 		if err != nil {
 			s.log(LogError, "error sending heartbeat in response to Op1")
 			return e, err
@@ -746,7 +740,7 @@ func (s *Session) ChannelVoiceJoin(ctx context.Context, gID, cID string, mute, d
 	voice.LogLevel = s.LogLevel
 	voice.Cond.L.Unlock()
 
-	err = s.VoiceStateUpdate(gID, cID, mute, deaf)
+	err = s.voiceStateUpdate(ctx, gID, cID, mute, deaf)
 	if err != nil {
 		return
 	}
@@ -765,6 +759,16 @@ func (s *Session) ChannelVoiceJoin(ctx context.Context, gID, cID string, mute, d
 //	mute    : If true, you will be set to muted upon joining.
 //	deaf    : If true, you will be set to deafened upon joining.
 func (s *Session) VoiceStateUpdate(gID, cID string, mute, deaf bool) (err error) {
+	return s.voiceStateUpdate(context.Background(), gID, cID, mute, deaf)
+}
+
+// voiceStateUpdate includes the gateway write in the caller's join/leave
+// deadline. It must remain usable while Open or Close holds the session lock.
+func (s *Session) voiceStateUpdate(
+	ctx context.Context,
+	gID, cID string,
+	mute, deaf bool,
+) (err error) {
 
 	s.log(LogInformational, "called")
 
@@ -777,16 +781,7 @@ func (s *Session) VoiceStateUpdate(gID, cID string, mute, deaf bool) (err error)
 
 	// Send the request to Discord that we want to join the voice channel
 	data := voiceChannelJoinOp{4, voiceChannelJoinData{&gID, channelID, mute, deaf}}
-
-	s.RLock()
-	defer s.RUnlock()
-	if s.wsConn == nil {
-		return ErrWSNotFound
-	}
-
-	s.wsMutex.Lock()
-	err = s.wsConn.WriteJSON(data)
-	s.wsMutex.Unlock()
+	err = s.writeGatewayJSON(ctx, data)
 	return
 }
 
@@ -880,9 +875,7 @@ func (s *Session) identify() error {
 	// Send Identify packet to Discord
 	op := identifyOp{2, s.Identify}
 	s.log(LogDebug, "Identify Packet: \n%#v", op)
-	s.wsMutex.Lock()
-	err := s.wsConn.WriteJSON(op)
-	s.wsMutex.Unlock()
+	err := s.writeGatewayJSON(context.Background(), op)
 
 	return err
 }
@@ -969,9 +962,10 @@ func (s *Session) CloseWithCode(closeCode int) (err error) {
 		s.log(LogInformational, "sending close frame")
 		// To cleanly close a connection, a client should send a close
 		// frame and wait for the server to close the connection.
-		s.wsMutex.Lock()
-		err := s.wsConn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(closeCode, ""))
-		s.wsMutex.Unlock()
+		err := writeWebsocketMessage(
+			context.Background(), &s.wsMutex, s.wsConn,
+			websocket.CloseMessage, websocket.FormatCloseMessage(closeCode, ""),
+		)
 		if err != nil {
 			s.log(LogInformational, "error closing websocket, %s", err)
 		}
@@ -985,7 +979,9 @@ func (s *Session) CloseWithCode(closeCode int) (err error) {
 			s.log(LogInformational, "error closing websocket, %s", err)
 		}
 
+		s.wsMutex.Lock()
 		s.wsConn = nil
+		s.wsMutex.Unlock()
 	}
 
 	s.Unlock()

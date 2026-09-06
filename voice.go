@@ -73,7 +73,7 @@ type VoiceConnection struct {
 	OpusSend chan []byte  // Chan for sending opus audio, automatically closed after dead, DON'T CLOSE YOURSELF
 	OpusRecv chan *Packet // Chan for receiving opus audio, automatically closed after dead, DON'T CLOSE YOURSELF
 
-	wsMu sync.Mutex
+	wsMu websocketMutex
 
 	// can be nil, use only for send message
 	// mostly this is available connection or nil, but rarely closed connection
@@ -147,15 +147,16 @@ func (v *VoiceConnection) Speaking(b bool) (err error) {
 	}
 
 	v.Cond.L.Lock()
-	defer v.Cond.L.Unlock()
-	if v.wsConn == nil {
-		return fmt.Errorf("no VoiceConnection websocket")
-	}
+	wsConn := v.wsConn
+	v.Cond.L.Unlock()
 	data := voiceSpeakingOp{5, voiceSpeakingData{b, 0}}
-	v.wsMu.Lock()
-	err = v.wsConn.WriteJSON(data)
-	v.wsMu.Unlock()
+	err = writeWebsocketJSON(context.Background(), &v.wsMu, wsConn, data)
 
+	v.Cond.L.Lock()
+	defer v.Cond.L.Unlock()
+	if v.wsConn != wsConn || v.Status == VoiceConnectionStatusDead {
+		return ErrWSNotFound
+	}
 	v.Cond.Broadcast()
 	if err != nil {
 		v.speaking = false
@@ -203,7 +204,7 @@ func (v *VoiceConnection) Disconnect(ctx context.Context) error {
 
 	v.log(LogInformational, "called")
 
-	err := v.session.VoiceStateUpdate(v.GuildID, "", true, true)
+	err := v.session.voiceStateUpdate(ctx, v.GuildID, "", true, true)
 	if err != nil {
 		return err
 	}
@@ -502,9 +503,7 @@ func (v *VoiceConnection) websocket(ctx context.Context, endpoint string, token 
 				MaxDAVEProtocolVersion: 1,
 			}}
 
-			v.wsMu.Lock()
-			err = wsConn.WriteJSON(data)
-			v.wsMu.Unlock()
+			err = writeWebsocketJSON(ctx, &v.wsMu, wsConn, data)
 			if err != nil {
 				err = fmt.Errorf("error sending identify packet, %w", err)
 				v.failure(err)
@@ -539,9 +538,7 @@ func (v *VoiceConnection) websocket(ctx context.Context, endpoint string, token 
 			v.log(LogInformational, "resuming voice websocket")
 			v.log(LogDebug, "resume packet, %#v", data)
 
-			v.wsMu.Lock()
-			err = wsConn.WriteJSON(data)
-			v.wsMu.Unlock()
+			err = writeWebsocketJSON(ctx, &v.wsMu, wsConn, data)
 			if err != nil {
 				err = fmt.Errorf("error sending resume packet, %w", err)
 				v.failure(err)
@@ -891,9 +888,7 @@ func (v *VoiceConnection) wsHeartbeat(ctx context.Context, wsConn *websocket.Con
 		v.Cond.L.Lock()
 		seqAck := v.seqAck
 		v.Cond.L.Unlock()
-		v.wsMu.Lock()
-		err = wsConn.WriteJSON(voiceHeartbeatOp{3, voiceHeartbeatData{time.Now().Unix(), seqAck}})
-		v.wsMu.Unlock()
+		err = writeWebsocketJSON(ctx, &v.wsMu, wsConn, voiceHeartbeatOp{3, voiceHeartbeatData{time.Now().Unix(), seqAck}})
 		if err != nil {
 			v.log(LogError, "error sending heartbeat to voice endpoint, %s", err)
 			return
@@ -1027,9 +1022,7 @@ encryptionModeLoop:
 	if wsConn == nil {
 		return
 	}
-	v.wsMu.Lock()
-	err = wsConn.WriteJSON(data)
-	v.wsMu.Unlock()
+	err = writeWebsocketJSON(ctx, &v.wsMu, wsConn, data)
 	if err != nil {
 		v.log(LogWarning, "udpop write error, %#v, %s", data, err)
 		return
@@ -1508,9 +1501,7 @@ func (v *VoiceConnection) sendDAVEKeyPackageBinary(kpData []byte) {
 	wsConn := v.wsConn
 	v.Cond.L.Unlock()
 	if wsConn != nil {
-		v.wsMu.Lock()
-		err := wsConn.WriteMessage(websocket.BinaryMessage, binMsg)
-		v.wsMu.Unlock()
+		err := writeWebsocketMessage(context.Background(), &v.wsMu, wsConn, websocket.BinaryMessage, binMsg)
 		if err != nil {
 			v.log(LogError, "DAVE key package send failed: %s", err)
 		}
@@ -1532,9 +1523,7 @@ func (v *VoiceConnection) sendDAVEReadyForTransition(transitionID uint16) {
 	wsConn := v.wsConn
 	v.Cond.L.Unlock()
 	if wsConn != nil {
-		v.wsMu.Lock()
-		err := wsConn.WriteJSON(readyOp{23, readyData{transitionID}})
-		v.wsMu.Unlock()
+		err := writeWebsocketJSON(context.Background(), &v.wsMu, wsConn, readyOp{23, readyData{transitionID}})
 		if err != nil {
 			v.log(LogError, "DAVE ready_for_transition send failed: %s", err)
 		}
@@ -1556,9 +1545,7 @@ func (v *VoiceConnection) sendDAVEInvalidCommitWelcome(transitionID uint16) {
 	wsConn := v.wsConn
 	v.Cond.L.Unlock()
 	if wsConn != nil {
-		v.wsMu.Lock()
-		err := wsConn.WriteJSON(invalidOp{31, invalidData{transitionID}})
-		v.wsMu.Unlock()
+		err := writeWebsocketJSON(context.Background(), &v.wsMu, wsConn, invalidOp{31, invalidData{transitionID}})
 		if err != nil {
 			v.log(LogError, "DAVE invalid_commit_welcome send failed: %s", err)
 		}

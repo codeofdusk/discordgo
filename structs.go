@@ -114,7 +114,8 @@ type Session struct {
 	handlers     map[string][]*eventHandlerInstance
 	onceHandlers map[string][]*eventHandlerInstance
 
-	// The websocket connection.
+	// The websocket connection. Replacements hold both the session lock and
+	// wsMutex; readers may hold either lock.
 	wsConn *websocket.Conn
 
 	// When nil, the session is not listening.
@@ -133,7 +134,7 @@ type Session struct {
 	sessionID string
 
 	// used to make sure gateway websocket writes do not happen concurrently
-	wsMutex sync.Mutex
+	wsMutex websocketMutex
 }
 
 // ApplicationIntegrationType dictates where application can be installed and its available interaction contexts.
