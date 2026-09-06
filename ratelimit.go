@@ -20,18 +20,33 @@ type customRateLimit struct {
 // RateLimiter holds all ratelimit buckets
 type RateLimiter struct {
 	sync.Mutex
-	global           *int64
-	buckets          map[string]*Bucket
-	globalRateLimit  time.Duration
-	customRateLimits []*customRateLimit
+	global             *int64
+	buckets            map[string]*Bucket
+	globalRateLimit    time.Duration
+	customRateLimits   []*customRateLimit
+	transientBuckets   map[string]*transientBucket
+	nextTransientPrune time.Time
+	now                func() time.Time
+}
+
+const transientBucketIdleTime = time.Minute
+
+// transientBucket tracks the whole request, including response processing and
+// retries when Bucket itself is unlocked. Active requests must share one bucket.
+type transientBucket struct {
+	bucket  *Bucket
+	users   int
+	expires time.Time
 }
 
 // NewRatelimiter returns a new RateLimiter
 func NewRatelimiter() *RateLimiter {
 
 	return &RateLimiter{
-		buckets: make(map[string]*Bucket),
-		global:  new(int64),
+		buckets:          make(map[string]*Bucket),
+		global:           new(int64),
+		transientBuckets: make(map[string]*transientBucket),
+		now:              time.Now,
 		customRateLimits: []*customRateLimit{
 			{
 				suffix:   "//reactions//",
@@ -51,6 +66,12 @@ func (r *RateLimiter) GetBucket(key string) *Bucket {
 		return bucket
 	}
 
+	b := r.newBucket(key)
+	r.buckets[key] = b
+	return b
+}
+
+func (r *RateLimiter) newBucket(key string) *Bucket {
 	b := &Bucket{
 		Remaining: 1,
 		Key:       key,
@@ -65,8 +86,46 @@ func (r *RateLimiter) GetBucket(key string) *Bucket {
 		}
 	}
 
-	r.buckets[key] = b
 	return b
+}
+
+// lockTransientBucket retains short-lived endpoint state until all users finish
+// and both the idle period and server's reset time have passed. Ordinary API
+// buckets retain their existing lifetime. Pruning needs no background worker.
+func (r *RateLimiter) lockTransientBucket(key string) (*Bucket, func()) {
+	r.Lock()
+	now := r.now()
+	if !now.Before(r.nextTransientPrune) {
+		for key, entry := range r.transientBuckets {
+			if entry.users == 0 && !now.Before(entry.expires) {
+				delete(r.transientBuckets, key)
+			}
+		}
+		r.nextTransientPrune = now.Add(transientBucketIdleTime)
+	}
+	entry := r.transientBuckets[key]
+	if entry == nil {
+		entry = &transientBucket{bucket: r.newBucket(key)}
+		r.transientBuckets[key] = entry
+	}
+	entry.users++
+	r.Unlock()
+
+	release := func() {
+		r.Lock()
+		defer r.Unlock()
+		entry.users--
+		if entry.users != 0 {
+			return
+		}
+		// No request can use this private bucket after its lease ends, so
+		// the reset is stable while the cache lock prevents a new lease.
+		entry.expires = r.now().Add(transientBucketIdleTime)
+		if entry.bucket.reset.After(entry.expires) {
+			entry.expires = entry.bucket.reset
+		}
+	}
+	return r.LockBucketObject(entry.bucket), release
 }
 
 // GetWaitTime returns the duration you should wait for a Bucket

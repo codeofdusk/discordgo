@@ -3195,18 +3195,23 @@ func (s *Session) ApplicationCommandPermissionsBatchEdit(appID, guildID string, 
 // resp        : Response message data.
 func (s *Session) InteractionRespond(interaction *Interaction, resp *InteractionResponse, options ...RequestOption) error {
 	endpoint := EndpointInteractionResponse(interaction.ID, interaction.Token)
-
+	contentType := "application/json"
+	var body []byte
+	var err error
 	if resp.Data != nil && len(resp.Data.Files) > 0 {
-		contentType, body, err := MultipartBodyWithJSON(resp, resp.Data.Files)
-		if err != nil {
-			return err
-		}
-
-		_, err = s.RequestRaw("POST", endpoint, contentType, body, endpoint, 0, options...)
+		contentType, body, err = MultipartBodyWithJSON(resp, resp.Data.Files)
+	} else {
+		body, err = Marshal(*resp)
+	}
+	if err != nil {
 		return err
 	}
 
-	_, err := s.RequestWithBucketID("POST", endpoint, *resp, endpoint, options...)
+	// Each callback has a unique endpoint. Keep its bucket through concurrent
+	// requests and retries, but do not retain every interaction for the session.
+	bucket, release := s.Ratelimiter.lockTransientBucket(endpoint)
+	defer release()
+	_, err = s.RequestWithLockedBucket("POST", endpoint, contentType, body, bucket, 0, options...)
 	return err
 }
 
