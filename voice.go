@@ -170,33 +170,9 @@ func (v *VoiceConnection) Speaking(b bool) (err error) {
 }
 
 func (v *VoiceConnection) WaitForDAVEReady(ctx context.Context) error {
-	v.Cond.L.Lock()
-	dave := v.dave
-	v.Cond.L.Unlock()
-
-	if dave == nil {
-		return nil
-	}
-
-	stopWake := make(chan struct{})
-	defer close(stopWake)
-	go func() {
-		select {
-		case <-ctx.Done():
-			v.Cond.Broadcast()
-		case <-stopWake:
-		}
-	}()
-
-	v.Cond.L.Lock()
-	defer v.Cond.L.Unlock()
-	for !dave.CanEncrypt() {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		v.Cond.Wait()
-	}
-	return nil
+	return v.waitFor(ctx, func() bool {
+		return v.Status != VoiceConnectionStatusDead && (v.dave == nil || v.dave.CanEncrypt())
+	})
 }
 
 // Disconnect requests disconnect from this voice channel and wait for disconencted
@@ -318,38 +294,36 @@ type voiceOP8 struct {
 // returns error if context timeout or VoiceConnection.Err
 func (v *VoiceConnection) waitUntilStatus(ctx context.Context, status VoiceConnectionStatus) error {
 	v.log(LogInformational, "called")
+	return v.waitFor(ctx, func() bool { return v.Status == status })
+}
 
-	// Buffered so the Cond waiter's send can never block while it holds
-	// Cond.L: an unbuffered send there would wedge the connection's lock
-	// forever once the caller had already returned on ctx expiry.
-	done := make(chan error, 1)
-
-	// Wake the Cond waiter when the context expires so it observes
-	// ctx.Err() instead of sleeping until an unrelated Broadcast.
-	stopWake := make(chan struct{})
-	defer close(stopWake)
-	go func() {
-		select {
-		case <-ctx.Done():
-			v.Cond.Broadcast()
-		case <-stopWake:
-		}
-	}()
-
-	go func() {
+// waitFor evaluates ready with Cond.L held. Taking the same lock in the
+// cancellation callback prevents a lost wakeup between checking ctx.Err and
+// entering Cond.Wait. The caller owns the wait; no orphan waiter survives it.
+func (v *VoiceConnection) waitFor(ctx context.Context, ready func() bool) error {
+	stop := context.AfterFunc(ctx, func() {
 		v.Cond.L.Lock()
-		defer v.Cond.L.Unlock()
-		for v.Status != status && v.Status != VoiceConnectionStatusDead {
-			if ctx.Err() != nil {
-				done <- ctx.Err()
-				return
-			}
-			v.Cond.Wait()
+		v.Cond.Broadcast()
+		v.Cond.L.Unlock()
+	})
+	defer stop()
+	v.Cond.L.Lock()
+	defer v.Cond.L.Unlock()
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
 		}
-		done <- v.Err
-	}()
-
-	return <-done
+		if ready() {
+			return v.Err
+		}
+		if v.Status == VoiceConnectionStatusDead {
+			if v.Err != nil {
+				return v.Err
+			}
+			return ErrVoiceConnectionDead
+		}
+		v.Cond.Wait()
+	}
 }
 
 // onVoiceServerUpdate handles a VOICE_SERVER_UPDATE event of main gateway.
@@ -382,6 +356,9 @@ var ErrVoiceNoSessionID = errors.New("did not receive voice Session ID in time")
 // ErrVoiceReconnectionLimit means reached a hard limit to reconnect
 var ErrVoiceReconnectionLimit = errors.New("reconnection limit reached")
 
+// ErrVoiceConnectionDead means the connection closed before it became ready.
+var ErrVoiceConnectionDead = errors.New("voice connection is dead")
+
 // ErrVoiceUnknownEncryptionMode means Discord requested encryption mode which is not supported
 var ErrVoiceUnknownEncryptionMode = errors.New("unknown encryption mode")
 
@@ -406,27 +383,16 @@ func (v *VoiceConnection) websocket(ctx context.Context, endpoint string, token 
 	v.wsCancel = cancel
 	v.Cond.L.Unlock()
 
-	sessionIDDone := make(chan struct{})
-	go func() {
-		v.Cond.L.Lock()
-		defer v.Cond.L.Unlock()
-		for v.sessionID == "" {
-			v.Cond.Wait()
+	sessionCtx, sessionCancel := context.WithTimeout(ctx, time.Second)
+	err := v.waitFor(sessionCtx, func() bool {
+		return v.Status != VoiceConnectionStatusDead && v.sessionID != ""
+	})
+	sessionCancel()
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+			v.failure(ErrVoiceNoSessionID)
 		}
-		close(sessionIDDone)
-	}()
-	timeout := time.NewTimer(1 * time.Second)
-
-	select {
-	case <-sessionIDDone:
-	case <-timeout.C:
-		v.failure(ErrVoiceNoSessionID)
 		return
-	}
-
-	// avoid resource leak before Go 1.23
-	if !timeout.Stop() {
-		<-timeout.C
 	}
 
 	v.Cond.L.Lock()
