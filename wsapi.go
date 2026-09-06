@@ -52,9 +52,17 @@ type resumePacket struct {
 // Open creates a websocket connection to Discord.
 // See: https://discord.com/developers/docs/topics/gateway#connecting
 func (s *Session) Open() error {
+	return s.open(context.Background())
+}
+
+const gatewayHandshakeTimeout = 20 * time.Second
+
+func (s *Session) open(ctx context.Context) error {
 	s.log(LogInformational, "called")
 
 	var err error
+	ctx, cancel := context.WithTimeout(ctx, gatewayHandshakeTimeout)
+	defer cancel()
 
 	// Prevent Open or other major Session functions from
 	// being called while Open is still running.
@@ -64,6 +72,9 @@ func (s *Session) Open() error {
 	// If the websock is already open, bail out here.
 	if s.wsConn != nil {
 		return ErrWSAlreadyOpen
+	}
+	if err = ctx.Err(); err != nil {
+		return err
 	}
 
 	sequence := atomic.LoadInt64(s.sequence)
@@ -75,7 +86,7 @@ func (s *Session) Open() error {
 		gateway = s.resumeGatewayURL
 	} else {
 		if s.gateway == "" {
-			s.gateway, err = s.Gateway()
+			s.gateway, err = s.Gateway(WithContext(ctx))
 			if err != nil {
 				return err
 			}
@@ -91,7 +102,7 @@ func (s *Session) Open() error {
 	s.log(LogInformational, "connecting to gateway %s", gateway)
 	header := http.Header{}
 	header.Add("accept-encoding", "zlib")
-	wsConn, _, err := s.Dialer.Dial(gateway, header)
+	wsConn, _, err := s.Dialer.DialContext(ctx, gateway, header)
 	if err != nil {
 		s.log(LogError, "error connecting to gateway %s, %s", s.gateway, err)
 		s.gateway = "" // clear cached gateway
@@ -114,6 +125,23 @@ func (s *Session) Open() error {
 			s.wsConn.Close()
 			s.wsConn = nil
 			s.wsMutex.Unlock()
+		}
+	}()
+
+	// Open owns the session lock through HELLO and READY/RESUMED. Bound the
+	// entire handshake so a silent gateway cannot indefinitely block Close.
+	deadline, _ := ctx.Deadline()
+	if err = wsConn.SetReadDeadline(deadline); err != nil {
+		return err
+	}
+	cancelled := make(chan struct{})
+	stopCancellation := context.AfterFunc(ctx, func() {
+		_ = wsConn.Close()
+		close(cancelled)
+	})
+	defer func() {
+		if stopCancellation != nil && !stopCancellation() {
+			<-cancelled
 		}
 	}()
 
@@ -144,7 +172,7 @@ func (s *Session) Open() error {
 	if s.sessionID == "" && sequence == 0 {
 
 		// Send Op 2 Identity Packet
-		err = s.identify()
+		err = s.identify(ctx)
 		if err != nil {
 			err = fmt.Errorf("error sending identify packet to gateway, %s, %s", s.gateway, err)
 			return err
@@ -160,7 +188,7 @@ func (s *Session) Open() error {
 		p.Data.Sequence = sequence
 
 		s.log(LogInformational, "sending resume packet to gateway")
-		err = s.writeGatewayJSON(context.Background(), p)
+		err = s.writeGatewayJSON(ctx, p)
 		if err != nil {
 			err = fmt.Errorf("error sending gateway resume packet, %s, %s", s.gateway, err)
 			return err
@@ -196,6 +224,16 @@ func (s *Session) Open() error {
 		s.log(LogWarning, "Expected READY/RESUMED, instead got:\n%#v\n", e)
 	}
 	s.log(LogInformational, "First Packet:\n%#v\n", e)
+	if !stopCancellation() {
+		<-cancelled
+	}
+	stopCancellation = nil
+	if err = ctx.Err(); err != nil {
+		return err
+	}
+	if err = wsConn.SetReadDeadline(time.Time{}); err != nil {
+		return err
+	}
 
 	s.log(LogInformational, "We are now connected to Discord, emitting connect event")
 	s.handleEvent(connectEventType, &Connect{})
@@ -845,7 +883,7 @@ type identifyOp struct {
 }
 
 // identify sends the identify packet to the gateway
-func (s *Session) identify() error {
+func (s *Session) identify(ctx context.Context) error {
 	s.log(LogDebug, "called")
 
 	// TODO: This is a temporary block of code to help
@@ -875,7 +913,7 @@ func (s *Session) identify() error {
 	// Send Identify packet to Discord
 	op := identifyOp{2, s.Identify}
 	s.log(LogDebug, "Identify Packet: \n%#v", op)
-	err := s.writeGatewayJSON(context.Background(), op)
+	err := s.writeGatewayJSON(ctx, op)
 
 	return err
 }
