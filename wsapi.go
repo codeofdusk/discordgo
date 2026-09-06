@@ -93,6 +93,7 @@ func (s *Session) openLocked(ctx context.Context) (err error) {
 	}()
 
 	sequence := atomic.LoadInt64(s.sequence)
+	resuming := s.sessionID != "" || sequence != 0
 
 	var gateway string
 	// Get the gateway to use for the Websocket connection
@@ -180,7 +181,7 @@ func (s *Session) openLocked(ctx context.Context) (err error) {
 
 	// Now we send either an Op 2 Identity if this is a brand new
 	// connection or Op 6 Resume if we are resuming an existing connection.
-	if s.sessionID == "" && sequence == 0 {
+	if !resuming {
 
 		// Send Op 2 Identity Packet
 		err = s.identify(ctx)
@@ -233,11 +234,19 @@ func (s *Session) openLocked(ctx context.Context) (err error) {
 	if err = gatewayReconnectRequest(e); err != nil {
 		return err
 	}
-	if e.Operation != 0 || (e.Type != `READY` && e.Type != `RESUMED`) {
+	if e.Operation != 0 || (!resuming && e.Type != `READY` && e.Type != `RESUMED`) {
 		return fmt.Errorf("expecting READY/RESUMED, got Op %d Type %s", e.Operation, e.Type)
 	}
-	if _, err = s.onGatewayEvent(e); err != nil {
-		return err
+	var replay *Event
+	if e.Type == `READY` || e.Type == `RESUMED` {
+		if _, err = s.onGatewayEvent(e); err != nil {
+			return err
+		}
+	} else {
+		// Discord may replay missed dispatches before RESUMED. Preserve the
+		// first event for the listener so arbitrary replay handlers do not
+		// run while Open owns the session lock.
+		replay = e
 	}
 	s.log(LogInformational, "First Packet:\n%#v\n", e)
 	if !stopCancellation() {
@@ -268,7 +277,7 @@ func (s *Session) openLocked(ctx context.Context) (err error) {
 
 	// Start sending heartbeats and reading messages from Discord.
 	go s.heartbeat(s.wsConn, s.listening, h.HeartbeatInterval)
-	go s.listen(s.wsConn, s.listening)
+	go s.listen(s.wsConn, s.listening, replay)
 
 	s.log(LogInformational, "exiting")
 	return nil
@@ -276,9 +285,20 @@ func (s *Session) openLocked(ctx context.Context) (err error) {
 
 // listen polls the websocket connection for events, it will stop when the
 // listening channel is closed, or an error occurs.
-func (s *Session) listen(wsConn *websocket.Conn, listening <-chan interface{}) {
+func (s *Session) listen(wsConn *websocket.Conn, listening <-chan interface{}, replay *Event) {
 
 	s.log(LogInformational, "called")
+	// Open starts this goroutine while holding Lock. Await its completion
+	// before delivering the first replay dispatch, including SyncEvents.
+	s.RLock()
+	current := s.wsConn == wsConn
+	s.RUnlock()
+	if !current {
+		return
+	}
+	if replay != nil {
+		s.onGatewayEvent(replay)
+	}
 
 	for {
 
