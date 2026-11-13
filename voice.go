@@ -1040,6 +1040,10 @@ type voiceUDPOp struct {
 	Data voiceUDPD `json:"d"`
 }
 
+// voiceUDPDiscoveryTimeout bounds the wait for the voice server's answer to
+// IP discovery, which normally arrives within one round trip.
+var voiceUDPDiscoveryTimeout = 5 * time.Second
+
 // udpOpen opens a UDP connection to the voice server and completes the
 // initial required handshake.  This connection is left open in the session
 // and can be used to send or receive audio.  This should only be called
@@ -1093,10 +1097,23 @@ func (v *VoiceConnection) udpOpen(ctx context.Context) (err error) {
 	// from Discord.  Once we get it parse the IP and PORT information out
 	// of the response.  This should be our public IP and PORT as Discord
 	// saw us.
+	//
+	// The request is a single datagram. If it or its response is lost, an
+	// unbounded read would stall this handshake, and the websocket loop that
+	// runs it, until something else cancelled the attempt.
 	rb := make([]byte, 74)
+	err = udpConn.SetReadDeadline(time.Now().Add(voiceUDPDiscoveryTimeout))
+	if err != nil {
+		return
+	}
 	rlen, _, err := udpConn.ReadFromUDP(rb)
 	if err != nil {
 		v.log(LogWarning, "udp read error, %s, %s", addr.String(), err)
+		return
+	}
+	// The receive pump reads this socket for as long as the attempt lives.
+	err = udpConn.SetReadDeadline(time.Time{})
+	if err != nil {
 		return
 	}
 
