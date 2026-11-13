@@ -307,7 +307,7 @@ func TestVoiceSessionSendsEveryFrameOfABurst(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	voice.onEvent(ctx, false, description)
+	voice.onEvent(voiceSocket{session: ctx, ctx: ctx}, false, description)
 
 	const burst = 6
 	for i := byte(0); i < burst; i++ {

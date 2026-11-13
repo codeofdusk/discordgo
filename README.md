@@ -20,6 +20,10 @@ include:
   resumes still fall back to a fresh identification after three attempts.
 - Voice session-ID, status and DAVE readiness waits stop on cancellation or
   connection death. Readiness notifications synchronize with the waiters.
+- A voice session whose websocket is lost resumes on a new one. Its UDP
+  socket, keys and audio carry on meanwhile, and nothing is negotiated again.
+  A resume that the voice server does not confirm within ten seconds fails
+  the connection.
 - Interaction callback buckets expire after a minute of inactivity once the
   server's reset time has passed. Active requests retain their shared bucket.
 - REST requests share one deadline across bucket waits, rate-limit delays and

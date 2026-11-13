@@ -106,8 +106,9 @@ type VoiceConnection struct {
 	seqAck int // for heartbeat and resume
 
 	// pumpsStarted records whether opusSender/opusReceiver are running for
-	// the current websocket attempt; reset when a new attempt begins so a
-	// repeated session description cannot double-start them.
+	// the current voice session; reset when a session starts so a repeated
+	// session description cannot double-start them. A session that has its
+	// pumps has been described, which is what makes it resumable.
 	pumpsStarted bool
 	receivers    sync.WaitGroup
 }
@@ -444,9 +445,22 @@ var ErrVoiceUnknownEncryptionMode = errors.New("unknown encryption mode")
 // server update arrived to replace it.
 var ErrVoiceDisconnected = errors.New("voice connection disconnected by Discord")
 
-// voiceResumeReadyTimeout bounds how long a resumed voice websocket may sit
-// without a fresh session description before the connection is failed.
-const voiceResumeReadyTimeout = 10 * time.Second
+// ErrVoiceResumeUnconfirmed means a voice server accepted a websocket opened
+// to resume a voice session and then never confirmed the resume.
+var ErrVoiceResumeUnconfirmed = errors.New("voice server did not confirm the resume")
+
+// voiceResumeTimeout bounds how long a websocket opened to resume a voice
+// session waits for the voice server to confirm the resume.
+var voiceResumeTimeout = 10 * time.Second
+
+// voiceSocketRetryDelay is the pause before replacing a websocket that was
+// lost without ever serving its session, so that a voice server which keeps
+// dropping its websockets is not dialled in a tight loop.
+var voiceSocketRetryDelay = time.Second
+
+// voiceSocketAttempts bounds how many websockets one voice server update may
+// open: the first, and one for each time its session is resumed or restarted.
+const voiceSocketAttempts = 100
 
 // voiceServerUpdateGrace bounds how long a connection whose websocket Discord
 // closed waits for the voice server update that would reopen it. A move
@@ -455,10 +469,10 @@ var voiceServerUpdateGrace = 5 * time.Second
 
 // awaitVoiceServerUpdate parks a websocket that Discord closed until ctx ends,
 // which is how both a replacement websocket and a kill take over, and reports
-// whether one did so within voiceServerUpdateGrace. stopAttempt ends the
-// closed websocket's pumps and heartbeat, which have nothing left to talk to.
-func (v *VoiceConnection) awaitVoiceServerUpdate(ctx context.Context, stopAttempt context.CancelFunc) bool {
-	stopAttempt()
+// whether one did so within voiceServerUpdateGrace. endSession stops the
+// closed websocket's session, whose pumps have nothing left to talk to.
+func (v *VoiceConnection) awaitVoiceServerUpdate(ctx context.Context, endSession context.CancelFunc) bool {
+	endSession()
 
 	v.Cond.L.Lock()
 	if v.Status != VoiceConnectionStatusDead {
@@ -477,17 +491,71 @@ func (v *VoiceConnection) awaitVoiceServerUpdate(ctx context.Context, stopAttemp
 	}
 }
 
-// websocket open the voice websocket, handle reconnect, and listens on it for messages and passes them to the voice event handler.
-// This is automatically called by the Open func.
+// voiceSocket is one websocket of a voice session. A session outlives the
+// websockets it is resumed on, and so do its UDP socket and audio pumps.
+type voiceSocket struct {
+	session context.Context // ends with the voice session
+	ctx     context.Context // ends with this websocket, and with its heartbeat
+	conn    *websocket.Conn
+}
+
+// voiceSocketEnd says what the loss of a voice websocket means for the
+// session it carried.
+type voiceSocketEnd int
+
+const (
+	// voiceSocketLost means nothing ended the session: the websocket failed
+	// underneath it, or the voice server reported its own crash.
+	voiceSocketLost voiceSocketEnd = iota
+	// voiceSocketDisconnected means Discord took the connection out of its
+	// call. Only the gateway knows whether it has been given another.
+	voiceSocketDisconnected
+	// voiceSocketClosed means the session is over and nothing will reopen
+	// the connection.
+	voiceSocketClosed
+)
+
+// voiceSocketEnded classifies the error that ended a voice websocket.
+func voiceSocketEnded(err error) voiceSocketEnd {
+	if errors.Is(err, ErrVoiceResumeUnconfirmed) {
+		return voiceSocketClosed
+	}
+	var closed *websocket.CloseError
+	if !errors.As(err, &closed) {
+		// A network-level disruption: a timeout, a TCP reset and the like.
+		return voiceSocketLost
+	}
+	switch closed.Code {
+	case 4014, 4022:
+		// 4014 indicates that the session user was disconnected or moved;
+		// 4022 indicates that the call was terminated (e.g., channel deleted, voice server changed, call ended).
+		return voiceSocketDisconnected
+	case 4015, websocket.CloseAbnormalClosure:
+		// 4015 indicates that the voice server crashed. 1006 stands for a
+		// websocket that broke off without a close code (unexpected EOF).
+		return voiceSocketLost
+	default:
+		// 4017 indicates DAVE protocol required but not supported;
+		// 4021 indicates that the voice connection was dropped due to rate limiting.
+		// Other code is our bad, should never happen, we stop reconnecting to avoid loop.
+		return voiceSocketClosed
+	}
+}
+
+// websocket opens the voice websocket for one voice server update and keeps a
+// voice session on it until ctx ends or the connection fails, passing what it
+// receives to the voice event handler.
+//
+// A session whose websocket is lost is resumed on another one. Resuming keeps
+// everything the session negotiated, so its UDP socket and audio pumps carry
+// on throughout. A websocket lost before its session was set up has nothing
+// to resume, and the next one starts the session again.
 func (v *VoiceConnection) websocket(ctx context.Context, endpoint string, token string) {
 
 	v.log(LogInformational, "called")
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	// connCtx spans every attempt this websocket makes; each attempt below
-	// derives its own context from it.
-	connCtx := ctx
 
 	v.Cond.L.Lock()
 	// Close a websocket if one is already open
@@ -497,11 +565,11 @@ func (v *VoiceConnection) websocket(ctx context.Context, endpoint string, token 
 	v.wsCancel = cancel
 	v.Cond.L.Unlock()
 
-	sessionCtx, sessionCancel := context.WithTimeout(ctx, time.Second)
-	err := v.waitFor(sessionCtx, func() bool {
+	idCtx, idCancel := context.WithTimeout(ctx, time.Second)
+	err := v.waitFor(idCtx, func() bool {
 		return v.Status != VoiceConnectionStatusDead && v.sessionID != ""
 	})
-	sessionCancel()
+	idCancel()
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
 			v.failure(ctx, ErrVoiceNoSessionID)
@@ -509,242 +577,266 @@ func (v *VoiceConnection) websocket(ctx context.Context, endpoint string, token 
 		return
 	}
 
-	v.Cond.L.Lock()
-	v.seqAck = -1
-	// This websocket starts a new voice session by identifying, and Discord
-	// requires each session to announce that it is speaking before it sends
-	// audio. Forget the announcement made on the session this one replaces
-	// (after a move or a voice server change) so the sender repeats it.
-	v.speaking = false
-	v.Cond.L.Unlock()
+	vg := "wss://" + endpoint + "?v=8"
 
-	for i := 0; i < 100; i++ {
+	// session ends with the current voice session, and endSession ends it.
+	var session context.Context
+	var endSession context.CancelFunc = func() {}
+	// startSession begins a voice session, stopping whatever the one before
+	// it had running. Nothing of that session carries over.
+	startSession := func() {
+		endSession()
+		session, endSession = context.WithCancel(ctx)
+		v.Cond.L.Lock()
+		v.seqAck = -1
+		// Discord requires each session to announce that it is speaking
+		// before it sends audio. Forget the announcement made on the session
+		// this one replaces (after a move or a voice server change) so the
+		// sender repeats it. An announcement still on its way to that
+		// session's websocket must not count for this one either.
+		v.speaking = false
+		v.wsConn = nil
+		// The session description starts this session's pumps, exactly once.
+		v.pumpsStarted = false
+		v.Cond.L.Unlock()
+	}
+	startSession()
+	// resume says the next websocket continues the session, not starts it.
+	resume := false
+
+	for attempt := 0; attempt < voiceSocketAttempts; attempt++ {
 		select {
 		case <-ctx.Done():
 			return
 		default:
 		}
 
-		ctx, cancel := context.WithCancel(ctx)
-		defer cancel() // this cancel() is not needed actually, but do it to suppress lint warning
+		socketCtx, closeSocket := context.WithCancel(session)
+		defer closeSocket() // this is not needed actually, but do it to suppress lint warning
 
 		v.Cond.L.Lock()
 		v.Status = VoiceConnectionStatusConnecting
-		// A fresh attempt gets fresh Opus pumps: the previous attempt's
-		// pumps die with its context, and the next session description
-		// must be able to start replacements exactly once.
-		v.pumpsStarted = false
 		v.Cond.Broadcast()
 		v.Cond.L.Unlock()
 
-		vg := "wss://" + endpoint + "?v=8"
 		v.log(LogInformational, "connecting to voice endpoint %s", vg)
 		// The dial must stop with its attempt: a handshake that outlives a
 		// kill or a superseding voice server update would go on to identify
 		// on behalf of work nobody wants any more.
-		wsConn, err := dialVoiceWebsocket(ctx, v.session.Dialer, vg)
-		if err == nil && ctx.Err() != nil {
-			_ = wsConn.Close()
+		conn, err := dialVoiceWebsocket(socketCtx, v.session.Dialer, vg)
+		if err == nil && socketCtx.Err() != nil {
+			_ = conn.Close()
 			return
 		}
 		if err != nil {
-			if ctx.Err() != nil {
+			if socketCtx.Err() != nil {
 				return
 			}
-			if i > 0 {
-				// A reconnect dial can hit a voice server that is briefly
-				// unreachable (restart, failover); burn a retry slot
-				// instead of declaring the connection dead on one miss.
-				v.log(LogWarning, "error connecting to voice endpoint %s, retrying, %v", vg, err)
-				select {
-				case <-ctx.Done():
-					return
-				case <-time.After(1 * time.Second):
-				}
-				continue
+			if attempt == 0 {
+				err = fmt.Errorf("error connecting to voice endpoint %s, %w", vg, err)
+				v.failure(socketCtx, err)
+				return
 			}
-			err = fmt.Errorf("error connecting to voice endpoint %s, %w", vg, err)
-			v.failure(ctx, err)
-			return
+			// A reconnect dial can hit a voice server that is briefly
+			// unreachable (restart, failover); burn a retry slot instead of
+			// declaring the connection dead on one miss.
+			v.log(LogWarning, "error connecting to voice endpoint %s, retrying, %v", vg, err)
+			closeSocket()
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(voiceSocketRetryDelay):
+			}
+			continue
 		}
+		socket := voiceSocket{session: session, ctx: socketCtx, conn: conn}
 		go func() {
-			<-ctx.Done()
+			<-socketCtx.Done()
 			// don't do graceful closing of websocket because it's not needed
-			err := wsConn.Close()
+			err := conn.Close()
 			v.log(LogDebug, "closed voice websocket due to context done: %v", err)
 		}()
 
 		v.Cond.L.Lock()
-		v.wsConn = wsConn
+		v.wsConn = conn
 		v.Cond.L.Unlock()
 
-		if i == 0 {
-			type voiceHandshakeData struct {
-				ServerID               string `json:"server_id"`
-				UserID                 string `json:"user_id"`
-				SessionID              string `json:"session_id"`
-				Token                  string `json:"token"`
-				MaxDAVEProtocolVersion int    `json:"max_dave_protocol_version"`
-			}
-			type voiceHandshakeOp struct {
-				Op   int                `json:"op"` // Always 0
-				Data voiceHandshakeData `json:"d"`
-			}
-			data := voiceHandshakeOp{0, voiceHandshakeData{
-				ServerID:               v.GuildID,
-				UserID:                 v.session.State.User.ID,
-				SessionID:              v.sessionID,
-				Token:                  token,
-				MaxDAVEProtocolVersion: 1,
-			}}
-
-			err = writeWebsocketJSON(ctx, &v.wsMu, wsConn, data)
-			if err != nil {
-				err = fmt.Errorf("error sending identify packet, %w", err)
-				v.failure(ctx, err)
-				return
-			}
+		if resume {
+			err = v.resumeVoiceSession(socket, token)
 		} else {
-			type voiceResumeData struct {
-				ServerID  string `json:"server_id"`
-				SessionID string `json:"session_id"`
-				Token     string `json:"token"`
-				SeqAck    int    `json:"seq_ack"`
-			}
-			type voiceResumeOp struct {
-				Op   int             `json:"op"` // Always 7
-				Data voiceResumeData `json:"d"`
-			}
-
-			v.Cond.L.Lock()
-			data := voiceResumeOp{7, voiceResumeData{
-				ServerID:  v.GuildID,
-				SessionID: v.sessionID,
-				Token:     token,
-				SeqAck:    v.seqAck,
-			}}
-			v.Cond.L.Unlock()
-
-			// Reset DAVE on reconnection
-			if v.dave != nil {
-				v.dave.Reset()
-			}
-
-			v.log(LogInformational, "resuming voice websocket")
-			v.log(LogDebug, "resume packet, %#v", data)
-
-			err = writeWebsocketJSON(ctx, &v.wsMu, wsConn, data)
-			if err != nil {
-				err = fmt.Errorf("error sending resume packet, %w", err)
-				v.failure(ctx, err)
-				return
-			}
-
-			// reopen UDP connection because WebSocket broken likely meaning UDP broken too.
-			err = v.udpOpen(ctx)
-			if err != nil {
-				err = fmt.Errorf("failed to resume UDP connection, %w", err)
-				v.failure(ctx, err)
-				return
-			}
-
-			// The resumed session only becomes usable once Discord answers
-			// the select_protocol re-sent by udpOpen with a fresh session
-			// description (op4), which restarts the Opus pumps and flips
-			// the status back to Ready. If that answer never comes, the
-			// connection would otherwise sit in Connecting forever with
-			// dead audio; bound the wait and fail cleanly instead.
-			go func(ctx context.Context) {
-				wctx, wcancel := context.WithTimeout(ctx, voiceResumeReadyTimeout)
-				defer wcancel()
-				err := v.waitUntilStatus(wctx, VoiceConnectionStatusReady)
-				// Only the watchdog's own deadline means the resume is
-				// stuck: nil is Ready, Canceled is a superseding attempt,
-				// and anything else means the connection already failed.
-				if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
-					v.failure(ctx, fmt.Errorf("voice resume did not restore a ready session: %w", err))
-				}
-			}(ctx)
+			err = v.identifyVoiceSession(socket, token)
+		}
+		if err != nil {
+			v.failure(socketCtx, err)
+			return
 		}
 
-		for {
+		err = v.readVoiceSocket(socket, resume)
+
+		// Abandon the voice WS connection
+		v.Cond.L.Lock()
+		if v.wsConn == conn {
+			v.wsConn = nil
+		}
+		// The session description makes a session resumable. Ready means
+		// this websocket went on to serve the session: it saw the session
+		// described, or resumed.
+		described := v.pumpsStarted
+		served := v.Status == VoiceConnectionStatusReady
+		v.Cond.Broadcast()
+		v.Cond.L.Unlock()
+
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		switch voiceSocketEnded(err) {
+		case voiceSocketClosed:
+			err := fmt.Errorf("voice websocket closed, %w", err)
+			v.failure(ctx, err)
+			return
+
+		case voiceSocketDisconnected:
+			// We shouldn't reconnect by ourselves, but the connection is
+			// not necessarily over: after a move or a voice server change
+			// the gateway sends a voice server update, which starts a new
+			// websocket and cancels this one. After a kick it sends a
+			// voice state update, which kills the connection. If the
+			// gateway sends neither (it may be down, or its own session
+			// was dropped), nobody else will ever report the death.
+			v.log(LogInformational, "voice websocket disconnected, awaiting a voice server update, %v", err)
+			if !v.awaitVoiceServerUpdate(ctx, endSession) {
+				v.failure(ctx, fmt.Errorf("%w, %w", ErrVoiceDisconnected, err))
+			}
+			return
+		}
+
+		// close goroutine related to websocket
+		closeSocket()
+		if described {
+			v.log(LogWarning, "voice websocket lost, resuming its session, %v", err)
+			resume = true
+		} else {
+			v.log(LogWarning, "voice websocket lost before its session was set up, starting again, %v", err)
+			startSession()
+			resume = false
+		}
+		if !served {
 			select {
 			case <-ctx.Done():
 				return
-			default:
+			case <-time.After(voiceSocketRetryDelay):
 			}
-
-			messageType, message, err := wsConn.ReadMessage()
-			if err != nil {
-				// Abandon the voice WS connection
-				v.Cond.L.Lock()
-				if v.wsConn == wsConn {
-					v.wsConn = nil
-				}
-				v.Cond.Broadcast()
-				v.Cond.L.Unlock()
-
-				select {
-				case <-ctx.Done():
-					return
-				default:
-				}
-
-				// 4017 indicates DAVE protocol required but not supported;
-				// 4021 indicates that the voice connection was dropped due to rate limiting.
-				// Nothing will reopen this connection.
-				if websocket.IsCloseError(err, 4017, 4021) {
-					v.failure(ctx, fmt.Errorf("voice websocket closed, %w", err))
-					return
-				}
-
-				// 4014 indicates that the session user was disconnected or moved;
-				// 4022 indicates that the call was terminated (e.g., channel deleted, voice server changed, call ended).
-				// We shouldn't reconnect by ourselves, but the connection is
-				// not necessarily over: after a move or a voice server change
-				// the gateway sends a voice server update, which starts a new
-				// websocket and cancels this one. After a kick it sends a
-				// voice state update, which kills the connection. If the
-				// gateway sends neither (it may be down, or its own session
-				// was dropped), nobody else will ever report the death.
-				if websocket.IsCloseError(err, 4014, 4022) {
-					v.log(LogInformational, "voice websocket disconnected, awaiting a voice server update, %v", err)
-					if !v.awaitVoiceServerUpdate(connCtx, cancel) {
-						v.failure(connCtx, fmt.Errorf("%w, %w", ErrVoiceDisconnected, err))
-					}
-					return
-				}
-
-				// 4015 indicates that voice server crashed so we should reconnect.
-				// 1006 (CloseAbnormalClosure) indicates a network-level disruption
-				// (unexpected EOF, TCP reset, etc.) — also recoverable via reconnect.
-				// Other code is our bad, should never happen, we stop reconnecting to avoid loop.
-				if websocket.IsUnexpectedCloseError(err, 4015, websocket.CloseAbnormalClosure) {
-					err := fmt.Errorf("voice websocket closed, %w", err)
-					v.failure(ctx, err)
-					return
-				}
-
-				v.log(LogInformational, "voice socket disconnected, reconnecting, %v", err)
-
-				// close goroutine related to websocket
-				cancel()
-
-				// reconnect
-				break
-			}
-
-			// Pass received message to voice event handler
-			v.onEvent(ctx, messageType == websocket.BinaryMessage, message)
 		}
 	}
 
 	v.failure(ctx, ErrVoiceReconnectionLimit)
 }
 
-// wsEvent handles any voice websocket events. This is only called by the
-// wsListen() function.
-func (v *VoiceConnection) onEvent(ctx context.Context, binary bool, message []byte) {
+// identifyVoiceSession starts a voice session on socket.
+func (v *VoiceConnection) identifyVoiceSession(socket voiceSocket, token string) error {
+	type voiceHandshakeData struct {
+		ServerID               string `json:"server_id"`
+		UserID                 string `json:"user_id"`
+		SessionID              string `json:"session_id"`
+		Token                  string `json:"token"`
+		MaxDAVEProtocolVersion int    `json:"max_dave_protocol_version"`
+	}
+	type voiceHandshakeOp struct {
+		Op   int                `json:"op"` // Always 0
+		Data voiceHandshakeData `json:"d"`
+	}
+
+	v.Cond.L.Lock()
+	data := voiceHandshakeOp{0, voiceHandshakeData{
+		ServerID:               v.GuildID,
+		UserID:                 v.session.State.User.ID,
+		SessionID:              v.sessionID,
+		Token:                  token,
+		MaxDAVEProtocolVersion: 1,
+	}}
+	v.Cond.L.Unlock()
+
+	err := writeWebsocketJSON(socket.ctx, &v.wsMu, socket.conn, data)
+	if err != nil {
+		return fmt.Errorf("error sending identify packet, %w", err)
+	}
+	return nil
+}
+
+// resumeVoiceSession asks the voice server to carry the current voice session
+// on socket. A resumed session keeps the protocol it selected, so nothing is
+// negotiated again: Discord ends a session that selects its protocol a second
+// time. The session's keys and DAVE state stay as they are.
+func (v *VoiceConnection) resumeVoiceSession(socket voiceSocket, token string) error {
+	type voiceResumeData struct {
+		ServerID  string `json:"server_id"`
+		SessionID string `json:"session_id"`
+		Token     string `json:"token"`
+		SeqAck    int    `json:"seq_ack"`
+	}
+	type voiceResumeOp struct {
+		Op   int             `json:"op"` // Always 7
+		Data voiceResumeData `json:"d"`
+	}
+
+	v.Cond.L.Lock()
+	data := voiceResumeOp{7, voiceResumeData{
+		ServerID:  v.GuildID,
+		SessionID: v.sessionID,
+		Token:     token,
+		SeqAck:    v.seqAck,
+	}}
+	v.Cond.L.Unlock()
+
+	v.log(LogInformational, "resuming voice websocket")
+	v.log(LogDebug, "resume packet, %#v", data)
+
+	err := writeWebsocketJSON(socket.ctx, &v.wsMu, socket.conn, data)
+	if err != nil {
+		return fmt.Errorf("error sending resume packet, %w", err)
+	}
+	return nil
+}
+
+// readVoiceSocket passes what the voice server sends on socket to the voice
+// event handler until the websocket fails, and returns why it did. A
+// websocket that is resuming a session fails with ErrVoiceResumeUnconfirmed
+// when the voice server has not confirmed the resume within
+// voiceResumeTimeout.
+func (v *VoiceConnection) readVoiceSocket(socket voiceSocket, resuming bool) error {
+	if resuming {
+		// The event handler lifts this deadline when the resume is confirmed.
+		err := socket.conn.SetReadDeadline(time.Now().Add(voiceResumeTimeout))
+		if err != nil {
+			return err
+		}
+	}
+	for {
+		select {
+		case <-socket.ctx.Done():
+			return socket.ctx.Err()
+		default:
+		}
+
+		messageType, message, err := socket.conn.ReadMessage()
+		if err != nil {
+			var timeout net.Error
+			if resuming && errors.As(err, &timeout) && timeout.Timeout() {
+				return fmt.Errorf("%w, %w", ErrVoiceResumeUnconfirmed, err)
+			}
+			return err
+		}
+
+		// Pass received message to voice event handler
+		v.onEvent(socket, messageType == websocket.BinaryMessage, message)
+	}
+}
+
+// onEvent handles one message from the voice server, received on socket.
+func (v *VoiceConnection) onEvent(socket voiceSocket, binary bool, message []byte) {
 
 	if binary {
 		v.log(LogDebug, "received binary: %x", message)
@@ -779,7 +871,7 @@ func (v *VoiceConnection) onEvent(ctx context.Context, binary bool, message []by
 
 			if err := json.Unmarshal(e.RawData, &op2); err != nil {
 				err := fmt.Errorf("OP2 unmarshal error, %w, %s", err, string(e.RawData))
-				v.failure(ctx, err)
+				v.failure(socket.ctx, err)
 				return
 			}
 
@@ -789,10 +881,10 @@ func (v *VoiceConnection) onEvent(ctx context.Context, binary bool, message []by
 			v.Cond.L.Unlock()
 
 			// Start the UDP connection
-			err := v.udpOpen(ctx)
+			err := v.udpOpen(socket.session)
 			if err != nil {
 				err := fmt.Errorf("error opening udp connection, %w", err)
-				v.failure(ctx, err)
+				v.failure(socket.ctx, err)
 				return
 			}
 
@@ -802,12 +894,12 @@ func (v *VoiceConnection) onEvent(ctx context.Context, binary bool, message []by
 			op4 := voiceOP4{}
 			if err := json.Unmarshal(e.RawData, &op4); err != nil {
 				err := fmt.Errorf("OP4 unmarshal error, %w, %s", err, string(e.RawData))
-				v.failure(ctx, err)
+				v.failure(socket.ctx, err)
 				return
 			}
 
 			v.Cond.L.Lock()
-			if ctx.Err() != nil || v.Status == VoiceConnectionStatusDead {
+			if socket.ctx.Err() != nil || v.Status == VoiceConnectionStatusDead {
 				v.Cond.L.Unlock()
 				return
 			}
@@ -817,13 +909,13 @@ func (v *VoiceConnection) onEvent(ctx context.Context, binary bool, message []by
 				block, err := aes.NewCipher(op4.SecretKey)
 				if err != nil {
 					v.Cond.L.Unlock()
-					v.failure(ctx, err)
+					v.failure(socket.ctx, err)
 					return
 				}
 				v.cipher, err = cipher.NewGCM(block)
 				if err != nil {
 					v.Cond.L.Unlock()
-					v.failure(ctx, err)
+					v.failure(socket.ctx, err)
 					return
 				}
 			case "aead_xchacha20_poly1305_rtpsize":
@@ -831,13 +923,13 @@ func (v *VoiceConnection) onEvent(ctx context.Context, binary bool, message []by
 				v.cipher, err = chacha20poly1305.NewX(op4.SecretKey)
 				if err != nil {
 					v.Cond.L.Unlock()
-					v.failure(ctx, err)
+					v.failure(socket.ctx, err)
 					return
 				}
 			default:
 				err := fmt.Errorf("%w: %s", ErrVoiceUnknownEncryptionMode, op4.Mode)
 				v.Cond.L.Unlock()
-				v.failure(ctx, err)
+				v.failure(socket.ctx, err)
 				return
 			}
 
@@ -856,7 +948,7 @@ func (v *VoiceConnection) onEvent(ctx context.Context, binary bool, message []by
 				}
 			}
 
-			// A session description can arrive more than once per attempt
+			// A session description can arrive more than once per session
 			// (e.g. a rekey); the pumps must only be started for the first
 			// one, or two senders would interleave on the same channel.
 			if !v.pumpsStarted {
@@ -865,7 +957,7 @@ func (v *VoiceConnection) onEvent(ctx context.Context, binary bool, message []by
 				if v.OpusSend == nil {
 					v.OpusSend = make(chan []byte, opusSendQueue)
 				}
-				go v.opusSender(ctx, 48000, 960)
+				go v.opusSender(socket.session, 48000, 960)
 
 				if !v.deaf {
 					if v.OpusRecv == nil {
@@ -875,7 +967,7 @@ func (v *VoiceConnection) onEvent(ctx context.Context, binary bool, message []by
 					v.receivers.Add(1)
 					go func() {
 						defer v.receivers.Done()
-						v.opusReceiver(ctx)
+						v.opusReceiver(socket.session)
 					}()
 				}
 			}
@@ -949,10 +1041,25 @@ func (v *VoiceConnection) onEvent(ctx context.Context, binary bool, message []by
 				return
 			}
 			// Start the voice websocket heartbeat to keep the connection alive
-			go v.wsHeartbeat(ctx, v.wsConn, op8.HeartbeatInterval)
+			go v.wsHeartbeat(socket.ctx, socket.conn, op8.HeartbeatInterval)
 
-		case 9: // resumed
+		case 9: // RESUMED
 			v.log(LogInformational, "resumed voice websocket")
+			// The session goes on as it was, so this websocket no longer has
+			// a deadline to meet.
+			if socket.conn != nil {
+				_ = socket.conn.SetReadDeadline(time.Time{})
+			}
+			v.Cond.L.Lock()
+			if socket.ctx.Err() == nil && v.Status != VoiceConnectionStatusDead && v.pumpsStarted {
+				v.Status = VoiceConnectionStatusReady
+				// Have the sender announce speaking on this websocket too.
+				// Discord does not document whether a resumed session keeps
+				// the announcement, and repeating it costs one message.
+				v.speaking = false
+			}
+			v.Cond.Broadcast()
+			v.Cond.L.Unlock()
 			return
 
 		case 13: // Client Disconnect
@@ -968,7 +1075,7 @@ func (v *VoiceConnection) onEvent(ctx context.Context, binary bool, message []by
 			return
 
 		case 24: // DAVE prepare_epoch
-			v.handleDAVEPrepareEpoch(ctx, e.RawData)
+			v.handleDAVEPrepareEpoch(socket.ctx, e.RawData)
 			return
 
 		default:
@@ -1316,6 +1423,12 @@ func (v *VoiceConnection) sendOpus(
 				return
 			}
 			// else, continue loop
+		}
+		// The select may have taken a frame although the session has ended.
+		// Going on with it would announce speaking on whichever websocket
+		// the connection has by now, on behalf of a session that is gone.
+		if ctx.Err() != nil {
+			return
 		}
 
 		v.Cond.L.Lock()
