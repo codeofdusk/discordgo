@@ -580,3 +580,46 @@ func TestVoiceHeartbeatStopsWithItsWebsocket(t *testing.T) {
 	case <-time.After(50 * time.Millisecond):
 	}
 }
+
+// A voice server update that arrives while a session is running starts a new
+// session on the details it brings, as a move to another channel does. The
+// pumps of the session it replaces read their parameters when they start,
+// and the new session's setup writes the same ones.
+func TestVoiceServerUpdateReplacesARunningSession(t *testing.T) {
+	server, voice, gateway := newVoiceSessionTest(t)
+	first := server.accept()
+	server.setUp(first, 1)
+	awaitVoiceReady(t, voice)
+
+	moved := &VoiceServerUpdate{GuildID: "guild", Token: "moved", Endpoint: &server.endpoint}
+	if err := voice.onVoiceServerUpdate(moved); err != nil {
+		t.Fatal(err)
+	}
+	second := server.accept()
+	var identify struct {
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal(server.setUp(second, 1), &identify); err != nil {
+		t.Fatal(err)
+	}
+	if identify.Token != "moved" {
+		t.Fatalf("new session identified with token %q, want the voice server update's", identify.Token)
+	}
+	awaitVoiceReady(t, voice)
+
+	if packet := sendVoiceTestFrame(t, server, voice, 1); packet.sequence != 0 {
+		t.Fatalf("new session's first packet is numbered %d, want 0", packet.sequence)
+	}
+	second.expect(5)
+	if discoveries := server.discoveries.Load(); discoveries != 2 {
+		t.Fatalf("connection opened %d UDP sockets, want one for each session", discoveries)
+	}
+	select {
+	case <-first.closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("connection kept the websocket of the session it replaced")
+	}
+	if leaves := gateway.leaves(t, voice.session); leaves != 0 {
+		t.Fatalf("connection sent %d gateway leaves, want none", leaves)
+	}
+}

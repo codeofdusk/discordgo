@@ -1395,12 +1395,16 @@ func (v *VoiceConnection) sendOpus(
 	var ok bool
 	udpHeader := make([]byte, 12)
 
-	var nonce = make([]byte, v.cipher.NonceSize())
+	// The session that follows this one writes these again while it sets up.
+	v.Cond.L.Lock()
+	nonce := make([]byte, v.cipher.NonceSize())
+	ssrc := v.op2.SSRC
+	v.Cond.L.Unlock()
 
 	// build the parts that don't change in the udpHeader
 	udpHeader[0] = 0x80
 	udpHeader[1] = 0x78
-	binary.BigEndian.PutUint32(udpHeader[8:], v.op2.SSRC)
+	binary.BigEndian.PutUint32(udpHeader[8:], ssrc)
 
 	// start a send loop that loops until buf chan is closed
 	backlog := 0
@@ -1484,9 +1488,9 @@ func (v *VoiceConnection) sendOpus(
 		binary.BigEndian.PutUint32(udpHeader[4:], timestamp)
 
 		binary.LittleEndian.PutUint32(nonce, i)
+		v.Cond.L.Lock()
 		sendbuf := make([]byte, len(udpHeader), len(udpHeader)+len(nonce)+len(recvbuf)+v.cipher.Overhead())
 		copy(sendbuf, udpHeader)
-		v.Cond.L.Lock()
 		sendbuf = v.cipher.Seal(sendbuf, nonce, recvbuf, udpHeader)
 		v.Cond.L.Unlock()
 		sendbuf = append(sendbuf, nonce[:4]...)
@@ -1532,10 +1536,10 @@ func (v *VoiceConnection) opusReceiver(ctx context.Context) {
 	v.Cond.L.Lock()
 	udpConn := v.udpConn
 	ch := v.OpusRecv
+	nonce := make([]byte, v.cipher.NonceSize())
 	v.Cond.L.Unlock()
 
 	recvbuf := make([]byte, 1024)
-	var nonce = make([]byte, v.cipher.NonceSize())
 
 	for {
 		rlen, err := udpConn.Read(recvbuf)
