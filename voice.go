@@ -462,6 +462,13 @@ var voiceSocketRetryDelay = time.Second
 // open: the first, and one for each time its session is resumed or restarted.
 const voiceSocketAttempts = 100
 
+// voiceSessionLimit is how many voice sessions one voice server update may
+// start. Discord can end a session while the connection keeps its place in
+// the call, and the voice server's details are then still good for another.
+// The limit keeps a voice server that ends every session it starts from
+// being asked for them indefinitely.
+const voiceSessionLimit = 3
+
 // voiceServerUpdateGrace bounds how long a connection whose websocket Discord
 // closed waits for the voice server update that would reopen it. A move
 // normally delivers one within a second.
@@ -507,18 +514,22 @@ const (
 	// voiceSocketLost means nothing ended the session: the websocket failed
 	// underneath it, or the voice server reported its own crash.
 	voiceSocketLost voiceSocketEnd = iota
+	// voiceSocketSessionOver means the voice server ended the session, or
+	// would not resume it, without saying that the connection has lost its
+	// place in the call.
+	voiceSocketSessionOver
 	// voiceSocketDisconnected means Discord took the connection out of its
 	// call. Only the gateway knows whether it has been given another.
 	voiceSocketDisconnected
-	// voiceSocketClosed means the session is over and nothing will reopen
-	// the connection.
-	voiceSocketClosed
+	// voiceSocketRefused means Discord will not have the connection in the
+	// call, and nothing will reopen it.
+	voiceSocketRefused
 )
 
 // voiceSocketEnded classifies the error that ended a voice websocket.
 func voiceSocketEnded(err error) voiceSocketEnd {
 	if errors.Is(err, ErrVoiceResumeUnconfirmed) {
-		return voiceSocketClosed
+		return voiceSocketSessionOver
 	}
 	var closed *websocket.CloseError
 	if !errors.As(err, &closed) {
@@ -534,11 +545,15 @@ func voiceSocketEnded(err error) voiceSocketEnd {
 		// 4015 indicates that the voice server crashed. 1006 stands for a
 		// websocket that broke off without a close code (unexpected EOF).
 		return voiceSocketLost
-	default:
+	case 4017, 4021:
 		// 4017 indicates DAVE protocol required but not supported;
 		// 4021 indicates that the voice connection was dropped due to rate limiting.
-		// Other code is our bad, should never happen, we stop reconnecting to avoid loop.
-		return voiceSocketClosed
+		return voiceSocketRefused
+	default:
+		// 4006 indicates that the session is no longer valid, and Discord's
+		// documentation says to start a new one. The remaining codes are
+		// our bad and should never happen; they end the session all the same.
+		return voiceSocketSessionOver
 	}
 }
 
@@ -550,6 +565,12 @@ func voiceSocketEnded(err error) voiceSocketEnd {
 // everything the session negotiated, so its UDP socket and audio pumps carry
 // on throughout. A websocket lost before its session was set up has nothing
 // to resume, and the next one starts the session again.
+//
+// A session that the voice server ends, or will not resume, is replaced by a
+// new one while voiceSessionLimit allows, provided the session had been
+// working: the voice server's details were good then. Otherwise only new
+// details can help, and the connection waits for the gateway to deliver them
+// in a voice server update, as it does after Discord disconnects it.
 func (v *VoiceConnection) websocket(ctx context.Context, endpoint string, token string) {
 
 	v.log(LogInformational, "called")
@@ -582,11 +603,13 @@ func (v *VoiceConnection) websocket(ctx context.Context, endpoint string, token 
 	// session ends with the current voice session, and endSession ends it.
 	var session context.Context
 	var endSession context.CancelFunc = func() {}
+	sessions := 0
 	// startSession begins a voice session, stopping whatever the one before
 	// it had running. Nothing of that session carries over.
 	startSession := func() {
 		endSession()
 		session, endSession = context.WithCancel(ctx)
+		sessions++
 		v.Cond.L.Lock()
 		v.seqAck = -1
 		// Discord requires each session to announce that it is speaking
@@ -692,13 +715,14 @@ func (v *VoiceConnection) websocket(ctx context.Context, endpoint string, token 
 		default:
 		}
 
-		switch voiceSocketEnded(err) {
-		case voiceSocketClosed:
+		end := voiceSocketEnded(err)
+		switch {
+		case end == voiceSocketRefused:
 			err := fmt.Errorf("voice websocket closed, %w", err)
 			v.failure(ctx, err)
 			return
 
-		case voiceSocketDisconnected:
+		case end == voiceSocketDisconnected:
 			// We shouldn't reconnect by ourselves, but the connection is
 			// not necessarily over: after a move or a voice server change
 			// the gateway sends a voice server update, which starts a new
@@ -711,19 +735,33 @@ func (v *VoiceConnection) websocket(ctx context.Context, endpoint string, token 
 				v.failure(ctx, fmt.Errorf("%w, %w", ErrVoiceDisconnected, err))
 			}
 			return
-		}
 
-		// close goroutine related to websocket
-		closeSocket()
-		if described {
+		case end == voiceSocketLost && described:
 			v.log(LogWarning, "voice websocket lost, resuming its session, %v", err)
+			// close goroutine related to websocket
+			closeSocket()
 			resume = true
-		} else {
-			v.log(LogWarning, "voice websocket lost before its session was set up, starting again, %v", err)
+
+		case sessions < voiceSessionLimit && (described || end == voiceSocketLost):
+			// The session had been working, or its websocket was lost before
+			// the voice server said anything against it.
+			v.log(LogWarning, "voice session ended, starting another, %v", err)
 			startSession()
 			resume = false
+
+		default:
+			// The voice server turned the session down from the start, or
+			// has ended as many as the connection may ask it for. Only new
+			// details from the gateway can help now. After a move they are
+			// due: the move changes the token and puts the session beyond
+			// use, and the voice server update may still be on its way.
+			v.log(LogWarning, "voice session ended, awaiting a voice server update, %v", err)
+			if !v.awaitVoiceServerUpdate(ctx, endSession) {
+				v.failure(ctx, fmt.Errorf("voice websocket closed, %w", err))
+			}
+			return
 		}
-		if !served {
+		if end == voiceSocketLost && !served {
 			select {
 			case <-ctx.Done():
 				return

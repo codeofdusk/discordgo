@@ -403,8 +403,9 @@ func TestConfirmedVoiceResumeOutlastsItsTimeout(t *testing.T) {
 
 // A voice server that takes the websocket and never confirms the resume
 // would otherwise hold the connection in a session that carries no audio.
-func TestUnconfirmedVoiceResumeFailsTheConnection(t *testing.T) {
+func TestUnconfirmedVoiceResumeStartsANewSession(t *testing.T) {
 	setVoiceResumeTimeout(t, 50*time.Millisecond)
+	setVoiceSocketRetryDelay(t, time.Hour)
 	server, voice, gateway := newVoiceSessionTest(t)
 	first := server.accept()
 	server.setUp(first, 1)
@@ -415,10 +416,179 @@ func TestUnconfirmedVoiceResumeFailsTheConnection(t *testing.T) {
 	second.expect(7)
 	second.hello()
 
-	awaitVoiceTest(t, voice.DeadChannel(), "the unconfirmed resume to fail the connection")
-	if !errors.Is(voice.Err, ErrVoiceResumeUnconfirmed) {
-		t.Fatalf("connection error = %v, want ErrVoiceResumeUnconfirmed", voice.Err)
+	third := server.accept()
+	server.setUp(third, 1)
+	awaitVoiceReady(t, voice)
+	select {
+	case <-second.closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("connection kept the websocket whose resume was never confirmed")
 	}
+	if leaves := gateway.leaves(t, voice.session); leaves != 0 {
+		t.Fatalf("connection sent %d gateway leaves, want none", leaves)
+	}
+}
+
+// awaitNoVoiceWebsocket fails if the connection opens another websocket.
+func awaitNoVoiceWebsocket(t *testing.T, server *voiceTestServer, why string) {
+	t.Helper()
+	select {
+	case <-server.sockets:
+		t.Fatalf("connection opened another voice websocket %s", why)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func voiceTestCloseCode(err error) int {
+	var closed *websocket.CloseError
+	if errors.As(err, &closed) {
+		return closed.Code
+	}
+	return 0
+}
+
+// Discord ends a voice session with close code 4006 when it is no longer
+// valid, which can happen while the connection keeps its place in the call.
+// That code used to fail the connection, and the call with it.
+func TestVoiceSessionThatDiscordEndsIsReplaced(t *testing.T) {
+	// The voice server has said the session is over: nothing is waited for.
+	setVoiceSocketRetryDelay(t, time.Hour)
+	setVoiceServerUpdateGrace(t, time.Hour)
+	server, voice, gateway := newVoiceSessionTest(t)
+	first := server.accept()
+	server.setUp(first, 1)
+	awaitVoiceReady(t, voice)
+	before := sendVoiceTestFrame(t, server, voice, 1)
+	first.expect(5)
+
+	first.close(4006)
+	second := server.accept()
+	var identify struct {
+		SessionID string `json:"session_id"`
+		Token     string `json:"token"`
+	}
+	if err := json.Unmarshal(server.setUp(second, 1), &identify); err != nil {
+		t.Fatal(err)
+	}
+	if identify.SessionID != "session" || identify.Token != "token" {
+		t.Fatalf("new session identified as %+v, want the voice server update's session and token", identify)
+	}
+	awaitVoiceReady(t, voice)
+
+	// Nothing of the ended session carries over: the new one has its own
+	// UDP socket and sender, and announces that it is speaking.
+	after := sendVoiceTestFrame(t, server, voice, 2)
+	if after.from == before.from || after.sequence != 0 {
+		t.Fatalf("new session's first packet came from %s numbered %d; the ended session sent from %s",
+			after.from, after.sequence, before.from)
+	}
+	second.expect(5)
+	if leaves := gateway.leaves(t, voice.session); leaves != 0 {
+		t.Fatalf("connection sent %d gateway leaves, want none", leaves)
+	}
+}
+
+// A voice server may have dropped the session by the time its websocket is
+// replaced. It answers the resume by closing the websocket.
+func TestRefusedVoiceResumeStartsANewSession(t *testing.T) {
+	setVoiceSocketRetryDelay(t, time.Hour)
+	setVoiceServerUpdateGrace(t, time.Hour)
+	server, voice, gateway := newVoiceSessionTest(t)
+	first := server.accept()
+	server.setUp(first, 1)
+	awaitVoiceReady(t, voice)
+
+	first.drop()
+	second := server.accept()
+	second.expect(7)
+	second.close(4006)
+
+	third := server.accept()
+	server.setUp(third, 1)
+	awaitVoiceReady(t, voice)
+	sendVoiceTestFrame(t, server, voice, 1)
+	third.expect(5)
+	if leaves := gateway.leaves(t, voice.session); leaves != 0 {
+		t.Fatalf("connection sent %d gateway leaves, want none", leaves)
+	}
+}
+
+// Moving the session user to another channel changes its voice token, and
+// the session it had cannot be used again. The new token comes in a voice
+// server update, which can arrive after the session has ended.
+func TestVoiceSessionEndedByAMoveAwaitsItsVoiceServerUpdate(t *testing.T) {
+	setVoiceServerUpdateGrace(t, time.Hour)
+	server, voice, gateway := newVoiceSessionTest(t)
+	first := server.accept()
+	server.setUp(first, 1)
+	awaitVoiceReady(t, voice)
+
+	first.close(4006)
+	// The connection asks for a session on the details it has, which the
+	// voice server turns down.
+	second := server.accept()
+	second.expect(0)
+	second.close(4006)
+	awaitNoVoiceWebsocket(t, server, "after the voice server turned its session down")
+
+	moved := &VoiceServerUpdate{GuildID: "guild", Token: "moved", Endpoint: &server.endpoint}
+	if err := voice.onVoiceServerUpdate(moved); err != nil {
+		t.Fatal(err)
+	}
+	third := server.accept()
+	var identify struct {
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal(server.setUp(third, 1), &identify); err != nil {
+		t.Fatal(err)
+	}
+	if identify.Token != "moved" {
+		t.Fatalf("moved connection identified with token %q, want the new voice server update's", identify.Token)
+	}
+	awaitVoiceReady(t, voice)
+	sendVoiceTestFrame(t, server, voice, 1)
+	third.expect(5)
+	if leaves := gateway.leaves(t, voice.session); leaves != 0 {
+		t.Fatalf("moved connection sent %d gateway leaves, want none", leaves)
+	}
+}
+
+// A voice server that turns a session down from the start is not asked
+// again: its details are no good. Without new ones the connection is over.
+func TestVoiceSessionTurnedDownWithoutVoiceServerUpdateKillsConnection(t *testing.T) {
+	setVoiceServerUpdateGrace(t, 20*time.Millisecond)
+	server, voice, gateway := newVoiceSessionTest(t)
+	first := server.accept()
+	first.expect(0)
+	first.close(4006)
+
+	awaitVoiceTest(t, voice.DeadChannel(), "the session turned down to kill the connection")
+	if code := voiceTestCloseCode(voice.Err); code != 4006 {
+		t.Fatalf("connection error = %v, want close code 4006", voice.Err)
+	}
+	awaitNoVoiceWebsocket(t, server, "after the voice server turned its session down")
+	if leaves := gateway.leaves(t, voice.session); leaves != 1 {
+		t.Fatalf("failed connection sent %d gateway leaves, want 1", leaves)
+	}
+}
+
+// A voice server that ends every session it starts is not asked for them
+// indefinitely.
+func TestVoiceServerThatEndsEverySessionKillsConnection(t *testing.T) {
+	setVoiceServerUpdateGrace(t, 20*time.Millisecond)
+	server, voice, gateway := newVoiceSessionTest(t)
+	for session := 0; session < voiceSessionLimit; session++ {
+		socket := server.accept()
+		server.setUp(socket, 1)
+		awaitVoiceReady(t, voice)
+		socket.close(4006)
+	}
+
+	awaitVoiceTest(t, voice.DeadChannel(), "the last session's end to kill the connection")
+	if code := voiceTestCloseCode(voice.Err); code != 4006 {
+		t.Fatalf("connection error = %v, want close code 4006", voice.Err)
+	}
+	awaitNoVoiceWebsocket(t, server, "beyond its limit of sessions")
 	if leaves := gateway.leaves(t, voice.session); leaves != 1 {
 		t.Fatalf("failed connection sent %d gateway leaves, want 1", leaves)
 	}
