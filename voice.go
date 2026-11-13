@@ -1201,6 +1201,34 @@ func (v *VoiceConnection) udpKeepAlive(ctx context.Context, udpConn *net.UDPConn
 	}
 }
 
+// opusClock assigns RTP timestamps to the frames of one stream. A receiver
+// measures delay by comparing each packet's timestamp with when it arrived,
+// so the timestamps have to keep step with real time. Counting frames alone
+// lets every pause in the audio pass for network delay, which the receiver
+// then buffers against.
+type opusClock struct {
+	interval  time.Duration // real time covered by one frame
+	samples   uint32        // timestamp units covered by one frame
+	timestamp uint32        // of the next frame
+	due       time.Time     // when the next frame continues the stream unbroken
+}
+
+// stamp returns the timestamp for a frame sent at now. Each whole interval
+// that passed with nothing to send is left out of the stream as a gap.
+func (c *opusClock) stamp(now time.Time) uint32 {
+	if c.due.IsZero() {
+		c.due = now
+	}
+	if gap := now.Sub(c.due) / c.interval; gap > 0 {
+		c.timestamp += uint32(gap) * c.samples
+		c.due = c.due.Add(gap * c.interval)
+	}
+	c.due = c.due.Add(c.interval)
+	timestamp := c.timestamp
+	c.timestamp += c.samples
+	return timestamp
+}
+
 // opusSender will listen on the given channel and send any
 // pre-encoded opus audio to Discord.  Supposedly.
 func (v *VoiceConnection) opusSender(ctx context.Context, rate, size int) {
@@ -1216,8 +1244,22 @@ func (v *VoiceConnection) opusSender(ctx context.Context, rate, size int) {
 	v.Cond.L.Unlock()
 	v.log(LogInformational, "opus sender starting udp_ready=%v opus_cap=%d", udpConn != nil, opusCap)
 
+	interval := time.Duration(size) * time.Second / time.Duration(rate)
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	v.sendOpus(ctx, udpConn, opusClock{interval: interval, samples: uint32(size)}, ticker.C, time.Now)
+}
+
+// sendOpus sends one queued frame for each tick until ctx ends, reading the
+// time each one goes out from now.
+func (v *VoiceConnection) sendOpus(
+	ctx context.Context,
+	udpConn *net.UDPConn,
+	clock opusClock,
+	ticks <-chan time.Time,
+	now func() time.Time,
+) {
 	var sequence uint16
-	var timestamp uint32
 	var recvbuf []byte
 	var ok bool
 	udpHeader := make([]byte, 12)
@@ -1230,8 +1272,6 @@ func (v *VoiceConnection) opusSender(ctx context.Context, rate, size int) {
 	binary.BigEndian.PutUint32(udpHeader[8:], v.op2.SSRC)
 
 	// start a send loop that loops until buf chan is closed
-	ticker := time.NewTicker(time.Millisecond * time.Duration(size/(rate/1000)))
-	defer ticker.Stop()
 	for i := uint32(0); true; i++ {
 
 		// Get data from chan.  If chan is closed, return.
@@ -1256,31 +1296,40 @@ func (v *VoiceConnection) opusSender(ctx context.Context, rate, size int) {
 		v.Cond.L.Unlock()
 		sampleLog := i < 5 || i%50 == 0
 		if sampleLog {
-			v.log(LogDebug, "opus sender dequeued idx=%d opus_len=%d queued=%d seq=%d timestamp=%d dave_active=%v speaking=%v", i, len(recvbuf), opusQueued, sequence, timestamp, daveActive, speaking)
+			v.log(LogDebug, "opus sender dequeued idx=%d opus_len=%d queued=%d seq=%d dave_active=%v speaking=%v", i, len(recvbuf), opusQueued, sequence, daveActive, speaking)
 		}
 
 		if !speaking {
 			err := v.Speaking(true)
 			if err != nil {
-				v.log(LogError, "error sending speaking packet idx=%d seq=%d timestamp=%d, %s", i, sequence, timestamp, err)
+				v.log(LogError, "error sending speaking packet idx=%d seq=%d, %s", i, sequence, err)
 			}
 		}
-
-		// Add sequence and timestamp to udpPacket
-		binary.BigEndian.PutUint16(udpHeader[2:], sequence)
-		binary.BigEndian.PutUint32(udpHeader[4:], timestamp)
 
 		if daveActive {
 			encrypted, err := dave.EncryptFrame(recvbuf)
 			if err != nil {
-				v.log(LogError, "DAVE encrypt error idx=%d seq=%d timestamp=%d opus_len=%d: %s", i, sequence, timestamp, len(recvbuf), err)
+				v.log(LogError, "DAVE encrypt error idx=%d seq=%d opus_len=%d: %s", i, sequence, len(recvbuf), err)
 			} else {
 				recvbuf = encrypted
 				if sampleLog {
-					v.log(LogDebug, "opus sender encrypted idx=%d encrypted_len=%d seq=%d timestamp=%d", i, len(recvbuf), sequence, timestamp)
+					v.log(LogDebug, "opus sender encrypted idx=%d encrypted_len=%d seq=%d", i, len(recvbuf), sequence)
 				}
 			}
 		}
+
+		// block here until we're exactly at the right time :)
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticks:
+			// continue
+		}
+		timestamp := clock.stamp(now())
+
+		// Add sequence and timestamp to udpPacket
+		binary.BigEndian.PutUint16(udpHeader[2:], sequence)
+		binary.BigEndian.PutUint32(udpHeader[4:], timestamp)
 
 		binary.LittleEndian.PutUint32(nonce, i)
 		sendbuf := make([]byte, len(udpHeader), len(udpHeader)+len(nonce)+len(recvbuf)+v.cipher.Overhead())
@@ -1290,14 +1339,7 @@ func (v *VoiceConnection) opusSender(ctx context.Context, rate, size int) {
 		v.Cond.L.Unlock()
 		sendbuf = append(sendbuf, nonce[:4]...)
 
-		// block here until we're exactly at the right time :)
 		// Then send rtp audio packet to Discord over UDP
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			// continue
-		}
 		_, err := udpConn.Write(sendbuf)
 
 		if err != nil {
@@ -1313,7 +1355,6 @@ func (v *VoiceConnection) opusSender(ctx context.Context, rate, size int) {
 		// don't care if it overflows because it is already defined in Go spec
 		// https://go.dev/ref/spec#Integer_overflow
 		sequence++
-		timestamp += uint32(size)
 	}
 }
 
