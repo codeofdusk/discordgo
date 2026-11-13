@@ -405,9 +405,42 @@ var ErrVoiceConnectionDead = errors.New("voice connection is dead")
 // ErrVoiceUnknownEncryptionMode means Discord requested encryption mode which is not supported
 var ErrVoiceUnknownEncryptionMode = errors.New("unknown encryption mode")
 
+// ErrVoiceDisconnected means Discord closed the voice websocket and no voice
+// server update arrived to replace it.
+var ErrVoiceDisconnected = errors.New("voice connection disconnected by Discord")
+
 // voiceResumeReadyTimeout bounds how long a resumed voice websocket may sit
 // without a fresh session description before the connection is failed.
 const voiceResumeReadyTimeout = 10 * time.Second
+
+// voiceServerUpdateGrace bounds how long a connection whose websocket Discord
+// closed waits for the voice server update that would reopen it. A move
+// normally delivers one within a second.
+var voiceServerUpdateGrace = 5 * time.Second
+
+// awaitVoiceServerUpdate parks a websocket that Discord closed until ctx ends,
+// which is how both a replacement websocket and a kill take over, and reports
+// whether one did so within voiceServerUpdateGrace. stopAttempt ends the
+// closed websocket's pumps and heartbeat, which have nothing left to talk to.
+func (v *VoiceConnection) awaitVoiceServerUpdate(ctx context.Context, stopAttempt context.CancelFunc) bool {
+	stopAttempt()
+
+	v.Cond.L.Lock()
+	if v.Status != VoiceConnectionStatusDead {
+		v.Status = VoiceConnectionStatusConnecting
+		v.Cond.Broadcast()
+	}
+	v.Cond.L.Unlock()
+
+	grace := time.NewTimer(voiceServerUpdateGrace)
+	defer grace.Stop()
+	select {
+	case <-ctx.Done():
+		return true
+	case <-grace.C:
+		return false
+	}
+}
 
 // websocket open the voice websocket, handle reconnect, and listens on it for messages and passes them to the voice event handler.
 // This is automatically called by the Open func.
@@ -417,6 +450,9 @@ func (v *VoiceConnection) websocket(ctx context.Context, endpoint string, token 
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	// connCtx spans every attempt this websocket makes; each attempt below
+	// derives its own context from it.
+	connCtx := ctx
 
 	v.Cond.L.Lock()
 	// Close a websocket if one is already open
@@ -614,14 +650,28 @@ func (v *VoiceConnection) websocket(ctx context.Context, endpoint string, token 
 				default:
 				}
 
-				// 4014 indicates a manual disconnection by someone in the guild;
 				// 4017 indicates DAVE protocol required but not supported;
-				// 4021 indicates that the voice connection was dropped due to rate limiting;
-				// 4022 indicates that the call was terminated (e.g., channel deleted, voice server changed, call ended).
-				// we shouldn't reconnect.
-				if websocket.IsCloseError(err, 4014, 4017, 4021, 4022) {
-					v.log(LogInformational, "received close code disconnected")
+				// 4021 indicates that the voice connection was dropped due to rate limiting.
+				// Nothing will reopen this connection.
+				if websocket.IsCloseError(err, 4017, 4021) {
+					v.failure(ctx, fmt.Errorf("voice websocket closed, %w", err))
+					return
+				}
 
+				// 4014 indicates that the session user was disconnected or moved;
+				// 4022 indicates that the call was terminated (e.g., channel deleted, voice server changed, call ended).
+				// We shouldn't reconnect by ourselves, but the connection is
+				// not necessarily over: after a move or a voice server change
+				// the gateway sends a voice server update, which starts a new
+				// websocket and cancels this one. After a kick it sends a
+				// voice state update, which kills the connection. If the
+				// gateway sends neither (it may be down, or its own session
+				// was dropped), nobody else will ever report the death.
+				if websocket.IsCloseError(err, 4014, 4022) {
+					v.log(LogInformational, "voice websocket disconnected, awaiting a voice server update, %v", err)
+					if !v.awaitVoiceServerUpdate(connCtx, cancel) {
+						v.failure(connCtx, fmt.Errorf("%w, %w", ErrVoiceDisconnected, err))
+					}
 					return
 				}
 
