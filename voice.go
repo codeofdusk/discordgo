@@ -194,9 +194,21 @@ func (v *VoiceConnection) Kill() {
 
 	v.log(LogInformational, "called")
 
+	v.kill(nil)
+
+	v.log(LogInformational, "done")
+}
+
+// kill moves the connection to Dead, recording cause as its error when this
+// call makes the transition. It reports whether it made the transition, and
+// whether the connection was still the session's connection for its guild.
+func (v *VoiceConnection) kill(cause error) (died, registered bool) {
+	// Leave the session's map before becoming observably Dead, so a join that
+	// sees the death cannot find this connection there and reuse it.
 	v.session.Lock()
 	if v.session.VoiceConnections[v.GuildID] == v {
 		delete(v.session.VoiceConnections, v.GuildID)
+		registered = true
 	}
 	v.session.Unlock()
 	v.Cond.L.Lock()
@@ -204,22 +216,25 @@ func (v *VoiceConnection) Kill() {
 	if v.wsCancel != nil {
 		v.wsCancel()
 	}
-	if v.Status != VoiceConnectionStatusDead {
-		v.Status = VoiceConnectionStatusDead
-		v.Cond.Broadcast()
-		close(v.dead)
-		go func() {
-			time.Sleep(100 * time.Millisecond) // safe
-			if v.OpusRecv != nil {
-				close(v.OpusRecv)
-			}
-			if v.OpusSend != nil {
-				close(v.OpusSend)
-			}
-		}()
+	if v.Status == VoiceConnectionStatusDead {
+		return false, registered
 	}
-
-	v.log(LogInformational, "done")
+	if cause != nil && v.Err == nil {
+		v.Err = cause
+	}
+	v.Status = VoiceConnectionStatusDead
+	v.Cond.Broadcast()
+	close(v.dead)
+	go func() {
+		time.Sleep(100 * time.Millisecond) // safe
+		if v.OpusRecv != nil {
+			close(v.OpusRecv)
+		}
+		if v.OpusSend != nil {
+			close(v.OpusSend)
+		}
+	}()
+	return true, registered
 }
 
 // AddHandler adds a Handler for VoiceSpeakingUpdate events.
@@ -242,23 +257,51 @@ type VoiceSpeakingUpdate struct {
 // Unexported Internal Functions Below.
 // ------------------------------------------------------------------------------------------------
 
-// unrecoverable error handling
-// VoiceConnection should be unlocked before calling this
-func (v *VoiceConnection) failure(err error) {
+// failure handles an unrecoverable error seen by work running under ctx.
+// VoiceConnection should be unlocked before calling this.
+//
+// Work whose context is already cancelled was stopped on purpose: by Kill, by
+// a newer voice server update, or by the reconnect loop replacing its own
+// attempt. The errors such work then runs into (a write on a closed socket, an
+// identify sent after its dial was abandoned) are consequences of that stop,
+// not failures of the connection, so they are ignored here. Treating them as
+// failures would kill whatever superseded the work and tell the gateway to
+// leave the guild, evicting a connection that is perfectly healthy.
+func (v *VoiceConnection) failure(ctx context.Context, err error) {
+	if ctx.Err() != nil {
+		v.log(LogDebug, "ignoring voice error from cancelled work, %v", err)
+		return
+	}
 	v.log(LogError, "voice unrecoverable error, %v", err.Error())
 	v.log(LogDebug, "voice struct: %#v\n", v)
-	// Record the error but leave the Dead transition to Kill: it owns
-	// closing v.dead and the Opus channels, and setting Status here would
-	// make Kill skip that work, leaving Dead-channel waiters and Opus
-	// consumers hanging on a connection that has already failed.
-	v.Cond.L.Lock()
-	if v.Err == nil {
-		v.Err = err
+	// kill owns the Dead transition: it records the error, closes v.dead and
+	// the Opus channels, and wakes Dead-channel waiters and Opus consumers.
+	died, registered := v.kill(err)
+	if !died || !registered {
+		// Either the connection was already dead, or the session no longer
+		// considered it the guild's connection. Its voice state is not ours
+		// to change.
+		return
 	}
-	v.Cond.L.Unlock()
-	// cleanup
-	v.Kill()
-	v.Disconnect(context.Background())
+	v.leaveAfterFailure()
+}
+
+// leaveAfterFailure asks the gateway to leave the guild's voice channel once
+// this connection has failed, so the session user does not linger there
+// without audio. It is skipped if a newer connection has since been
+// registered for the guild: the leave would apply to that one.
+func (v *VoiceConnection) leaveAfterFailure() {
+	v.session.RLock()
+	_, replaced := v.session.VoiceConnections[v.GuildID]
+	v.session.RUnlock()
+	if replaced {
+		return
+	}
+	// voiceStateUpdate bounds the gateway write itself.
+	err := v.session.voiceStateUpdate(context.Background(), v.GuildID, "", true, true)
+	if err != nil {
+		v.log(LogWarning, "could not leave voice after failure, %v", err)
+	}
 }
 
 // voiceWebsocketMessage is basic message struct of voice websocket
@@ -390,7 +433,7 @@ func (v *VoiceConnection) websocket(ctx context.Context, endpoint string, token 
 	sessionCancel()
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
-			v.failure(ErrVoiceNoSessionID)
+			v.failure(ctx, ErrVoiceNoSessionID)
 		}
 		return
 	}
@@ -420,8 +463,18 @@ func (v *VoiceConnection) websocket(ctx context.Context, endpoint string, token 
 
 		vg := "wss://" + endpoint + "?v=8"
 		v.log(LogInformational, "connecting to voice endpoint %s", vg)
-		wsConn, _, err := v.session.Dialer.Dial(vg, nil)
+		// The dial must stop with its attempt: a handshake that outlives a
+		// kill or a superseding voice server update would go on to identify
+		// on behalf of work nobody wants any more.
+		wsConn, _, err := v.session.Dialer.DialContext(ctx, vg, nil)
+		if err == nil && ctx.Err() != nil {
+			_ = wsConn.Close()
+			return
+		}
 		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
 			if i > 0 {
 				// A reconnect dial can hit a voice server that is briefly
 				// unreachable (restart, failover); burn a retry slot
@@ -435,7 +488,7 @@ func (v *VoiceConnection) websocket(ctx context.Context, endpoint string, token 
 				continue
 			}
 			err = fmt.Errorf("error connecting to voice endpoint %s, %w", vg, err)
-			v.failure(err)
+			v.failure(ctx, err)
 			return
 		}
 		go func() {
@@ -472,7 +525,7 @@ func (v *VoiceConnection) websocket(ctx context.Context, endpoint string, token 
 			err = writeWebsocketJSON(ctx, &v.wsMu, wsConn, data)
 			if err != nil {
 				err = fmt.Errorf("error sending identify packet, %w", err)
-				v.failure(err)
+				v.failure(ctx, err)
 				return
 			}
 		} else {
@@ -507,7 +560,7 @@ func (v *VoiceConnection) websocket(ctx context.Context, endpoint string, token 
 			err = writeWebsocketJSON(ctx, &v.wsMu, wsConn, data)
 			if err != nil {
 				err = fmt.Errorf("error sending resume packet, %w", err)
-				v.failure(err)
+				v.failure(ctx, err)
 				return
 			}
 
@@ -515,7 +568,7 @@ func (v *VoiceConnection) websocket(ctx context.Context, endpoint string, token 
 			err = v.udpOpen(ctx)
 			if err != nil {
 				err = fmt.Errorf("failed to resume UDP connection, %w", err)
-				v.failure(err)
+				v.failure(ctx, err)
 				return
 			}
 
@@ -533,7 +586,7 @@ func (v *VoiceConnection) websocket(ctx context.Context, endpoint string, token 
 				// stuck: nil is Ready, Canceled is a superseding attempt,
 				// and anything else means the connection already failed.
 				if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
-					v.failure(fmt.Errorf("voice resume did not restore a ready session: %w", err))
+					v.failure(ctx, fmt.Errorf("voice resume did not restore a ready session: %w", err))
 				}
 			}(ctx)
 		}
@@ -578,7 +631,7 @@ func (v *VoiceConnection) websocket(ctx context.Context, endpoint string, token 
 				// Other code is our bad, should never happen, we stop reconnecting to avoid loop.
 				if websocket.IsUnexpectedCloseError(err, 4015, websocket.CloseAbnormalClosure) {
 					err := fmt.Errorf("voice websocket closed, %w", err)
-					v.failure(err)
+					v.failure(ctx, err)
 					return
 				}
 
@@ -596,7 +649,7 @@ func (v *VoiceConnection) websocket(ctx context.Context, endpoint string, token 
 		}
 	}
 
-	v.failure(ErrVoiceReconnectionLimit)
+	v.failure(ctx, ErrVoiceReconnectionLimit)
 }
 
 // wsEvent handles any voice websocket events. This is only called by the
@@ -636,7 +689,7 @@ func (v *VoiceConnection) onEvent(ctx context.Context, binary bool, message []by
 
 			if err := json.Unmarshal(e.RawData, &op2); err != nil {
 				err := fmt.Errorf("OP2 unmarshal error, %w, %s", err, string(e.RawData))
-				v.failure(err)
+				v.failure(ctx, err)
 				return
 			}
 
@@ -649,7 +702,7 @@ func (v *VoiceConnection) onEvent(ctx context.Context, binary bool, message []by
 			err := v.udpOpen(ctx)
 			if err != nil {
 				err := fmt.Errorf("error opening udp connection, %w", err)
-				v.failure(err)
+				v.failure(ctx, err)
 				return
 			}
 
@@ -659,7 +712,7 @@ func (v *VoiceConnection) onEvent(ctx context.Context, binary bool, message []by
 			op4 := voiceOP4{}
 			if err := json.Unmarshal(e.RawData, &op4); err != nil {
 				err := fmt.Errorf("OP4 unmarshal error, %w, %s", err, string(e.RawData))
-				v.failure(err)
+				v.failure(ctx, err)
 				return
 			}
 
@@ -670,13 +723,13 @@ func (v *VoiceConnection) onEvent(ctx context.Context, binary bool, message []by
 				block, err := aes.NewCipher(op4.SecretKey)
 				if err != nil {
 					v.Cond.L.Unlock()
-					v.failure(err)
+					v.failure(ctx, err)
 					return
 				}
 				v.cipher, err = cipher.NewGCM(block)
 				if err != nil {
 					v.Cond.L.Unlock()
-					v.failure(err)
+					v.failure(ctx, err)
 					return
 				}
 			case "aead_xchacha20_poly1305_rtpsize":
@@ -684,13 +737,13 @@ func (v *VoiceConnection) onEvent(ctx context.Context, binary bool, message []by
 				v.cipher, err = chacha20poly1305.NewX(op4.SecretKey)
 				if err != nil {
 					v.Cond.L.Unlock()
-					v.failure(err)
+					v.failure(ctx, err)
 					return
 				}
 			default:
 				err := fmt.Errorf("%w: %s", ErrVoiceUnknownEncryptionMode, op4.Mode)
 				v.Cond.L.Unlock()
-				v.failure(err)
+				v.failure(ctx, err)
 				return
 			}
 
@@ -1133,7 +1186,7 @@ func (v *VoiceConnection) opusSender(ctx context.Context, rate, size int) {
 		if err != nil {
 			v.log(LogError, "udp write failed idx=%d seq=%d timestamp=%d opus_len=%d udp_len=%d dave_active=%v: %s", i, sequence, timestamp, len(recvbuf), len(sendbuf), daveActive, err)
 			err := fmt.Errorf("udp write error, %w", err)
-			v.failure(err)
+			v.failure(ctx, err)
 			return
 		}
 		if sampleLog {
@@ -1182,7 +1235,7 @@ func (v *VoiceConnection) opusReceiver(ctx context.Context) {
 				return
 			default:
 				err := fmt.Errorf("udp read error, %w", err)
-				v.failure(err)
+				v.failure(ctx, err)
 				return
 			}
 		}
