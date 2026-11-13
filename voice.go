@@ -70,7 +70,9 @@ type VoiceConnection struct {
 	mute     bool
 	speaking bool
 
-	OpusSend chan []byte  // Chan for sending opus audio, automatically closed after dead, DON'T CLOSE YOURSELF
+	// OpusSend accepts caller-owned audio. It stays open after death so a
+	// concurrent producer can never panic; use DeadChannel to stop producing.
+	OpusSend chan []byte
 	OpusRecv chan *Packet // Chan for receiving opus audio, automatically closed after dead, DON'T CLOSE YOURSELF
 
 	wsMu websocketMutex
@@ -107,6 +109,7 @@ type VoiceConnection struct {
 	// the current websocket attempt; reset when a new attempt begins so a
 	// repeated session description cannot double-start them.
 	pumpsStarted bool
+	receivers    sync.WaitGroup
 }
 
 // DeadChannel exposes the close notification channel for callers that need a
@@ -116,6 +119,38 @@ func (v *VoiceConnection) DeadChannel() <-chan struct{} {
 		return nil
 	}
 	return v.Dead
+}
+
+// SendOpusFrame queues an owned copy of the newest frame without blocking.
+// Replacing queued audio prevents a temporary sender stall from becoming a
+// standing delay. It returns false when the connection cannot accept audio.
+func (v *VoiceConnection) SendOpusFrame(opus []byte) bool {
+	if v == nil || len(opus) == 0 {
+		return false
+	}
+	if v.Cond != nil {
+		v.Cond.L.Lock()
+		defer v.Cond.L.Unlock()
+	}
+	if v.Status == VoiceConnectionStatusDead || v.OpusSend == nil {
+		return false
+	}
+	frame := append([]byte(nil), opus...)
+	select {
+	case v.OpusSend <- frame:
+		return true
+	default:
+	}
+	select {
+	case <-v.OpusSend:
+	default:
+	}
+	select {
+	case v.OpusSend <- frame:
+		return true
+	default:
+		return false
+	}
 }
 
 // VoiceSpeakingUpdateHandler type provides a function definition for the
@@ -225,13 +260,13 @@ func (v *VoiceConnection) kill(cause error) (died, registered bool) {
 	v.Status = VoiceConnectionStatusDead
 	v.Cond.Broadcast()
 	close(v.dead)
+	recv := v.OpusRecv
 	go func() {
-		time.Sleep(100 * time.Millisecond) // safe
-		if v.OpusRecv != nil {
-			close(v.OpusRecv)
-		}
-		if v.OpusSend != nil {
-			close(v.OpusSend)
+		// UDP readers may still be unwinding cancellation. Only their exit,
+		// not an arbitrary delay, makes closing the receive channel safe.
+		v.receivers.Wait()
+		if recv != nil {
+			close(recv)
 		}
 	}()
 	return true, registered
@@ -274,8 +309,8 @@ func (v *VoiceConnection) failure(ctx context.Context, err error) {
 	}
 	v.log(LogError, "voice unrecoverable error, %v", err.Error())
 	v.log(LogDebug, "voice struct: %#v\n", v)
-	// kill owns the Dead transition: it records the error, closes v.dead and
-	// the Opus channels, and wakes Dead-channel waiters and Opus consumers.
+	// kill owns the Dead transition and wakes liveness waiters; the receive
+	// channel closes once its producers have stopped.
 	died, registered := v.kill(err)
 	if !died || !registered {
 		// Either the connection was already dead, or the session no longer
@@ -767,6 +802,10 @@ func (v *VoiceConnection) onEvent(ctx context.Context, binary bool, message []by
 			}
 
 			v.Cond.L.Lock()
+			if ctx.Err() != nil || v.Status == VoiceConnectionStatusDead {
+				v.Cond.L.Unlock()
+				return
+			}
 			v.op4 = op4
 			switch op4.Mode {
 			case "aead_aes256_gcm_rtpsize":
@@ -819,7 +858,7 @@ func (v *VoiceConnection) onEvent(ctx context.Context, binary bool, message []by
 				v.pumpsStarted = true
 
 				if v.OpusSend == nil {
-					v.OpusSend = make(chan []byte, 16)
+					v.OpusSend = make(chan []byte, 1)
 				}
 				go v.opusSender(ctx, 48000, 960)
 
@@ -828,7 +867,11 @@ func (v *VoiceConnection) onEvent(ctx context.Context, binary bool, message []by
 						v.OpusRecv = make(chan *Packet, 2)
 					}
 
-					go v.opusReceiver(ctx)
+					v.receivers.Add(1)
+					go func() {
+						defer v.receivers.Done()
+						v.opusReceiver(ctx)
+					}()
 				}
 			}
 
