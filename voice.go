@@ -949,8 +949,10 @@ type voiceUDPOp struct {
 func (v *VoiceConnection) udpOpen(ctx context.Context) (err error) {
 
 	v.Cond.L.Lock()
+	op2 := v.op2
+	v.Cond.L.Unlock()
 
-	host := v.op2.IP + ":" + strconv.Itoa(v.op2.Port)
+	host := op2.IP + ":" + strconv.Itoa(op2.Port)
 	addr, err := net.ResolveUDPAddr("udp", host)
 	if err != nil {
 		v.log(LogWarning, "error resolving udp host %s, %s", host, err)
@@ -964,8 +966,8 @@ func (v *VoiceConnection) udpOpen(ctx context.Context) (err error) {
 		return
 	}
 
+	v.Cond.L.Lock()
 	v.udpConn = udpConn
-
 	v.Cond.Broadcast()
 	v.Cond.L.Unlock()
 
@@ -978,12 +980,12 @@ func (v *VoiceConnection) udpOpen(ctx context.Context) (err error) {
 
 	// Create a 74 byte array to store the packet data
 	sb := make([]byte, 74)
-	binary.BigEndian.PutUint16(sb, 1)              // Packet type (0x1 is request, 0x2 is response)
-	binary.BigEndian.PutUint16(sb[2:], 70)         // Packet length (excluding type and length fields)
-	binary.BigEndian.PutUint32(sb[4:], v.op2.SSRC) // The SSRC code from the Op 2 VoiceConnection event
+	binary.BigEndian.PutUint16(sb, 1)            // Packet type (0x1 is request, 0x2 is response)
+	binary.BigEndian.PutUint16(sb[2:], 70)       // Packet length (excluding type and length fields)
+	binary.BigEndian.PutUint32(sb[4:], op2.SSRC) // The SSRC code from the Op 2 VoiceConnection event
 
 	// And send that data over the UDP connection to Discord.
-	_, err = v.udpConn.Write(sb)
+	_, err = udpConn.Write(sb)
 	if err != nil {
 		v.log(LogWarning, "udp write error to %s, %s", addr.String(), err)
 		return
@@ -994,7 +996,7 @@ func (v *VoiceConnection) udpOpen(ctx context.Context) (err error) {
 	// of the response.  This should be our public IP and PORT as Discord
 	// saw us.
 	rb := make([]byte, 74)
-	rlen, _, err := v.udpConn.ReadFromUDP(rb)
+	rlen, _, err := udpConn.ReadFromUDP(rb)
 	if err != nil {
 		v.log(LogWarning, "udp read error, %s, %s", addr.String(), err)
 		return
@@ -1021,7 +1023,7 @@ func (v *VoiceConnection) udpOpen(ctx context.Context) (err error) {
 
 	encryptionMode := ""
 encryptionModeLoop:
-	for _, mode := range v.op2.Modes {
+	for _, mode := range op2.Modes {
 		switch mode {
 		case "aead_aes256_gcm_rtpsize":
 			encryptionMode = mode
@@ -1048,7 +1050,7 @@ encryptionModeLoop:
 	}
 
 	// start udpKeepAlive
-	go v.udpKeepAlive(ctx, v.udpConn, 5*time.Second)
+	go v.udpKeepAlive(ctx, udpConn, 5*time.Second)
 	// TODO: find a way to check that it fired off okay
 
 	return
