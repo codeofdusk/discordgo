@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"net"
 	"sync"
 	"testing"
@@ -13,17 +14,20 @@ import (
 func TestVoiceSendOpusFrameKeepsLatestOwnedAudio(t *testing.T) {
 	v := &VoiceConnection{
 		Cond:     sync.NewCond(&sync.Mutex{}),
-		OpusSend: make(chan []byte, 1),
+		OpusSend: make(chan []byte, opusSendQueue),
 	}
-	for i := byte(1); i <= 20; i++ {
+	const sent = opusSendQueue + 5
+	for i := byte(1); i <= sent; i++ {
 		frame := []byte{i}
 		if !v.SendOpusFrame(frame) {
 			t.Fatal("audio queue unexpectedly rejected a frame")
 		}
 		frame[0] = 0
 	}
-	if got := <-v.OpusSend; !bytes.Equal(got, []byte{20}) {
-		t.Fatalf("queued audio = %v, want newest owned frame [20]", got)
+	for want := byte(sent - opusSendQueue + 1); want <= sent; want++ {
+		if got := <-v.OpusSend; !bytes.Equal(got, []byte{want}) {
+			t.Fatalf("queued audio = %v, want owned frame [%d]: the newest frames, oldest first", got, want)
+		}
 	}
 }
 
@@ -103,7 +107,8 @@ type opusTestPacket struct {
 	opus      []byte
 }
 
-func newOpusSenderTest(t *testing.T) *opusSenderTest {
+// newOpusSenderTest starts a sender that finds the given frames queued.
+func newOpusSenderTest(t *testing.T, queued ...byte) *opusSenderTest {
 	t.Helper()
 	server, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
 	if err != nil {
@@ -115,7 +120,7 @@ func newOpusSenderTest(t *testing.T) *opusSenderTest {
 	}
 	s, _ := newVoiceTestSession(t)
 	voice := newVoiceTestConnection(s)
-	voice.OpusSend = make(chan []byte, 1)
+	voice.OpusSend = make(chan []byte, opusSendQueue)
 	voice.cipher = testAEAD{}
 	voice.speaking = true
 	st := &opusSenderTest{
@@ -124,6 +129,9 @@ func newOpusSenderTest(t *testing.T) *opusSenderTest {
 		server: server,
 		ticks:  make(chan time.Time),
 		now:    time.Unix(1000, 0),
+	}
+	for _, frame := range queued {
+		st.queue(frame)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -169,6 +177,26 @@ func (st *opusSenderTest) tick() {
 	case st.ticks <- time.Time{}:
 	case <-time.After(2 * time.Second):
 		st.t.Fatal("sender was not waiting for a tick")
+	}
+}
+
+// awaitQueued waits for the sender to leave exactly n frames queued.
+func (st *opusSenderTest) awaitQueued(n int) {
+	st.t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for len(st.voice.OpusSend) != n {
+		if time.Now().After(deadline) {
+			st.t.Fatalf("%d frames queued, want %d", len(st.voice.OpusSend), n)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func (st *opusSenderTest) noPacket() {
+	st.t.Helper()
+	_ = st.server.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+	if n, err := st.server.Read(make([]byte, 1500)); err == nil {
+		st.t.Fatalf("sender sent a %d byte packet before its tick", n)
 	}
 }
 
@@ -245,6 +273,131 @@ func TestOpusClockLeavesOutOnlyWholeIdleIntervals(t *testing.T) {
 		for i, ms := range tt.sends {
 			if got := clock.stamp(at(ms)); got != tt.want[i] {
 				t.Errorf("%s: frame at %dms stamped %d, want %d", tt.name, ms, got, tt.want[i])
+			}
+		}
+	}
+}
+
+// A call bridged from the telephone network delivers its audio unevenly: a
+// packet that was late is followed at once by the ones held up behind it. A
+// sender with room for one waiting frame dropped the rest of each burst.
+func TestVoiceSessionSendsEveryFrameOfABurst(t *testing.T) {
+	s, _ := newVoiceTestSession(t)
+	voice := newVoiceTestConnection(s)
+	server := newVoiceUDPTestServer(t, voice)
+	conn, err := net.DialUDP("udp4", nil, server.LocalAddr().(*net.UDPAddr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	voice.udpConn = conn
+	voice.deaf = true
+	voice.speaking = true
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(func() {
+		cancel()
+		voice.Kill()
+		_ = conn.Close()
+	})
+
+	key, err := json.Marshal(voiceOP4{SecretKey: make([]byte, 32), Mode: "aead_aes256_gcm_rtpsize"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	description, err := json.Marshal(voiceWebsocketMessage{Operation: 4, RawData: key})
+	if err != nil {
+		t.Fatal(err)
+	}
+	voice.onEvent(ctx, false, description)
+
+	const burst = 6
+	for i := byte(0); i < burst; i++ {
+		if !voice.SendOpusFrame([]byte{i}) {
+			t.Fatalf("session refused frame %d", i)
+		}
+	}
+	buf := make([]byte, 1500)
+	for want := uint16(0); want < burst; want++ {
+		_ = server.SetReadDeadline(time.Now().Add(2 * time.Second))
+		n, err := server.Read(buf)
+		if err != nil {
+			t.Fatalf("frame %d of the burst was not sent: %v", want, err)
+		}
+		if got := binary.BigEndian.Uint16(buf[2:4]); n < 12 || got != want {
+			t.Fatalf("packet %d has sequence %d and %d bytes", want, got, n)
+		}
+	}
+}
+
+// Frames left waiting behind one another are delay the listener hears, and
+// once queued they would wait for the rest of the call.
+func TestVoiceSenderWorksOffAStandingQueue(t *testing.T) {
+	const standing = 2
+	st := newOpusSenderTest(t, 1, 2)
+	next := byte(standing)
+	// A steady stream replaces each frame the sender takes.
+	refill := func(taken int) {
+		t.Helper()
+		st.awaitQueued(standing - taken)
+		for ; taken > 0; taken-- {
+			next++
+			st.queue(next)
+		}
+	}
+	var packets []opusTestPacket
+	ticked := func() {
+		t.Helper()
+		st.advance(20 * time.Millisecond)
+		st.tick()
+		packets = append(packets, st.packet())
+	}
+
+	// Every frame finds another waiting behind it. The sender keeps to its
+	// ticks until that has gone on for opusBacklogFrames frames.
+	for frame := 1; frame < opusBacklogFrames; frame++ {
+		refill(1)
+		if frame == opusBacklogFrames-1 {
+			st.noPacket()
+		}
+		ticked()
+	}
+	// The next frame goes out ahead of its turn, on no tick.
+	packets = append(packets, st.packet())
+	// The sender went on to take the one after, which waits for its turn.
+	refill(2)
+	st.noPacket()
+	ticked()
+	// The frame sent ahead took up no time of its own, so an interval that
+	// passes with nothing sent still shows.
+	refill(1)
+	st.advance(20 * time.Millisecond)
+	ticked()
+
+	for i, p := range packets {
+		if !bytes.Equal(p.opus, []byte{byte(i + 1)}) {
+			t.Fatalf("packet %d carries frame %v", i, p.opus)
+		}
+		want := packets[0].timestamp + uint32(i)*960
+		if i == len(packets)-1 {
+			want += 960
+		}
+		if p.timestamp != want {
+			t.Errorf("packet %d is stamped %d, want %d", i, p.timestamp, want)
+		}
+	}
+}
+
+// A queue that keeps running empty is absorbing uneven arrivals rather than
+// holding the audio up, however long that goes on.
+func TestVoiceSenderKeepsAQueueThatRunsEmpty(t *testing.T) {
+	st := newOpusSenderTest(t)
+	for pair := 0; pair < opusBacklogFrames+5; pair++ {
+		st.queue(1)
+		st.queue(2)
+		for want := byte(1); want <= 2; want++ {
+			st.advance(20 * time.Millisecond)
+			st.tick()
+			if p := st.packet(); !bytes.Equal(p.opus, []byte{want}) {
+				t.Fatalf("pair %d: sent frame %v, want [%d]", pair, p.opus, want)
 			}
 		}
 	}

@@ -121,9 +121,9 @@ func (v *VoiceConnection) DeadChannel() <-chan struct{} {
 	return v.Dead
 }
 
-// SendOpusFrame queues an owned copy of the newest frame without blocking.
-// Replacing queued audio prevents a temporary sender stall from becoming a
-// standing delay. It returns false when the connection cannot accept audio.
+// SendOpusFrame queues an owned copy of a frame without blocking. A full
+// queue gives up its oldest frame to make room. It returns false when the
+// connection cannot accept audio.
 func (v *VoiceConnection) SendOpusFrame(opus []byte) bool {
 	if v == nil || len(opus) == 0 {
 		return false
@@ -863,7 +863,7 @@ func (v *VoiceConnection) onEvent(ctx context.Context, binary bool, message []by
 				v.pumpsStarted = true
 
 				if v.OpusSend == nil {
-					v.OpusSend = make(chan []byte, 1)
+					v.OpusSend = make(chan []byte, opusSendQueue)
 				}
 				go v.opusSender(ctx, 48000, 960)
 
@@ -1201,6 +1201,23 @@ func (v *VoiceConnection) udpKeepAlive(ctx context.Context, udpConn *net.UDPConn
 	}
 }
 
+const (
+	// opusSendQueue is how many frames may wait for the sender. Audio relayed
+	// from another network arrives unevenly: a packet that was late there is
+	// followed at once by the ones held up behind it. Frames dropped from
+	// such a burst are heard as cuts in the audio. A full queue gives up its
+	// oldest frame, so a stalled sender builds no more delay than this.
+	opusSendQueue = 10
+
+	// opusBacklogFrames is how many frames in a row may each have to wait
+	// behind the one before, which is delay the listener hears, before the
+	// sender sends one ahead of its turn. A queue that runs empty within a
+	// second is covering for uneven arrivals. One that never does is only
+	// holding the audio back, and the frame sent ahead is left to the
+	// listener's own buffer to absorb.
+	opusBacklogFrames = 50
+)
+
 // opusClock assigns RTP timestamps to the frames of one stream. A receiver
 // measures delay by comparing each packet's timestamp with when it arrived,
 // so the timestamps have to keep step with real time. Counting frames alone
@@ -1224,6 +1241,12 @@ func (c *opusClock) stamp(now time.Time) uint32 {
 		c.due = c.due.Add(gap * c.interval)
 	}
 	c.due = c.due.Add(c.interval)
+	return c.stampAhead()
+}
+
+// stampAhead returns the timestamp for a frame sent ahead of its turn. It
+// continues the stream without taking up any real time.
+func (c *opusClock) stampAhead() uint32 {
 	timestamp := c.timestamp
 	c.timestamp += c.samples
 	return timestamp
@@ -1251,7 +1274,8 @@ func (v *VoiceConnection) opusSender(ctx context.Context, rate, size int) {
 }
 
 // sendOpus sends one queued frame for each tick until ctx ends, reading the
-// time each one goes out from now.
+// time each one goes out from now. It sends a frame between ticks when
+// frames have been waiting in the queue for too long.
 func (v *VoiceConnection) sendOpus(
 	ctx context.Context,
 	udpConn *net.UDPConn,
@@ -1272,7 +1296,16 @@ func (v *VoiceConnection) sendOpus(
 	binary.BigEndian.PutUint32(udpHeader[8:], v.op2.SSRC)
 
 	// start a send loop that loops until buf chan is closed
+	backlog := 0
 	for i := uint32(0); true; i++ {
+
+		// A frame queued when the last one has just gone out has been
+		// waiting for its turn.
+		if len(v.OpusSend) > 0 {
+			backlog++
+		} else {
+			backlog = 0
+		}
 
 		// Get data from chan.  If chan is closed, return.
 		select {
@@ -1318,14 +1351,20 @@ func (v *VoiceConnection) sendOpus(
 			}
 		}
 
-		// block here until we're exactly at the right time :)
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticks:
-			// continue
+		var timestamp uint32
+		if backlog >= opusBacklogFrames {
+			backlog = 0
+			timestamp = clock.stampAhead()
+		} else {
+			// block here until we're exactly at the right time :)
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticks:
+				// continue
+			}
+			timestamp = clock.stamp(now())
 		}
-		timestamp := clock.stamp(now())
 
 		// Add sequence and timestamp to udpPacket
 		binary.BigEndian.PutUint16(udpHeader[2:], sequence)
