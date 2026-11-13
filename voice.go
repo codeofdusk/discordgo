@@ -469,6 +469,10 @@ const voiceSocketAttempts = 100
 // being asked for them indefinitely.
 const voiceSessionLimit = 3
 
+// voiceCloseWait bounds the sending of the close frame that ends a voice
+// session the connection has finished with.
+const voiceCloseWait = time.Second
+
 // voiceServerUpdateGrace bounds how long a connection whose websocket Discord
 // closed waits for the voice server update that would reopen it. A move
 // normally delivers one within a second.
@@ -675,7 +679,16 @@ func (v *VoiceConnection) websocket(ctx context.Context, endpoint string, token 
 		socket := voiceSocket{session: session, ctx: socketCtx, conn: conn}
 		go func() {
 			<-socketCtx.Done()
-			// don't do graceful closing of websocket because it's not needed
+			if socket.session.Err() != nil {
+				// The connection has finished with the session, so say so.
+				// A websocket that only breaks off is what a voice server
+				// keeps a session for, in case it is resumed.
+				_ = conn.WriteControl(
+					websocket.CloseMessage,
+					websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""),
+					time.Now().Add(voiceCloseWait),
+				)
+			}
 			err := conn.Close()
 			v.log(LogDebug, "closed voice websocket due to context done: %v", err)
 		}()

@@ -420,7 +420,10 @@ func TestUnconfirmedVoiceResumeStartsANewSession(t *testing.T) {
 	server.setUp(third, 1)
 	awaitVoiceReady(t, voice)
 	select {
-	case <-second.closed:
+	case code := <-second.closed:
+		if code != websocket.CloseNormalClosure {
+			t.Fatalf("connection ended the unconfirmed websocket with code %d, want a normal closure", code)
+		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("connection kept the websocket whose resume was never confirmed")
 	}
@@ -784,12 +787,36 @@ func TestVoiceServerUpdateReplacesARunningSession(t *testing.T) {
 	if discoveries := server.discoveries.Load(); discoveries != 2 {
 		t.Fatalf("connection opened %d UDP sockets, want one for each session", discoveries)
 	}
+	// The connection tells the voice server that the replaced session is
+	// over. A websocket that only broke off would leave it resumable.
 	select {
-	case <-first.closed:
+	case code := <-first.closed:
+		if code != websocket.CloseNormalClosure {
+			t.Fatalf("connection ended the replaced session's websocket with code %d, want a normal closure", code)
+		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("connection kept the websocket of the session it replaced")
 	}
 	if leaves := gateway.leaves(t, voice.session); leaves != 0 {
 		t.Fatalf("connection sent %d gateway leaves, want none", leaves)
+	}
+}
+
+// A connection that is killed has finished with its session, whether it left
+// the channel or failed.
+func TestKilledVoiceConnectionEndsItsSession(t *testing.T) {
+	server, voice, _ := newVoiceSessionTest(t)
+	socket := server.accept()
+	server.setUp(socket, 1)
+	awaitVoiceReady(t, voice)
+
+	voice.Kill()
+	select {
+	case code := <-socket.closed:
+		if code != websocket.CloseNormalClosure {
+			t.Fatalf("killed connection ended its websocket with code %d, want a normal closure", code)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("killed connection kept its websocket")
 	}
 }

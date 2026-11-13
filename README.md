@@ -27,6 +27,8 @@ include:
   update may start three sessions. A session that the voice server turns down
   from the start is not retried: the connection waits five seconds for a
   voice server update, as it does when Discord disconnects it, and then fails.
+- A voice session that the connection has finished with is ended by a
+  normal-closure close frame, so the voice server does not keep it to resume.
 - Interaction callback buckets expire after a minute of inactivity once the
   server's reset time has passed. Active requests retain their shared bucket.
 - REST requests share one deadline across bucket waits, rate-limit delays and
