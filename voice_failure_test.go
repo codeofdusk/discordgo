@@ -218,9 +218,9 @@ func TestVoiceKillDuringDialSendsNoLeave(t *testing.T) {
 	awaitVoiceTest(t, endpoint.dialing, "the voice handshake to start")
 
 	voice.Kill()
+	awaitVoiceTest(t, done, "the killed dial to stop before its handshake is released")
 	// Without cancellation the abandoned handshake would complete now.
 	endpoint.proceed()
-	awaitVoiceTest(t, done, "the killed connection's websocket to stop")
 
 	if leaves := gateway.leaves(t, s); leaves != 0 {
 		t.Fatalf("killed connection sent %d gateway leaves, want none", leaves)
@@ -232,6 +232,50 @@ func TestVoiceKillDuringDialSendsNoLeave(t *testing.T) {
 	case op := <-endpoint.identified:
 		t.Fatalf("killed connection still sent op %d to the voice server", op)
 	default:
+	}
+}
+
+func TestKilledVoiceDialCannotLeaveReplacementChannel(t *testing.T) {
+	s, gateway := newVoiceTestSession(t)
+	endpoint := newVoiceTestEndpoint(t, s)
+	voice := newVoiceTestConnection(s)
+	if err := s.voiceStateUpdate(context.Background(), "guild", "chan-1", false, false); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		voice.websocket(context.Background(), endpoint.address, "token")
+	}()
+	awaitVoiceTest(t, endpoint.dialing, "the first channel's voice dial")
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if err := voice.Disconnect(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("unacknowledged leave = %v, want deadline exceeded", err)
+	}
+	voice.Kill()
+	current := newVoiceTestConnection(s)
+	defer current.Kill()
+	if err := s.voiceStateUpdate(context.Background(), "guild", "chan-2", false, false); err != nil {
+		t.Fatal(err)
+	}
+	endpoint.proceed()
+	awaitVoiceTest(t, done, "the abandoned first dial to stop")
+	if leaves := gateway.leaves(t, s); leaves != 1 {
+		t.Fatalf("voice replacement received %d leaves, want the single deliberate leave", leaves)
+	}
+	want := []string{"chan-1", "", "chan-2", "sync-marker"}
+	updates := gateway.snapshot()
+	if len(updates) != len(want) {
+		t.Fatalf("gateway updates = %q, want %q", updates, want)
+	}
+	for i, channel := range want {
+		if updates[i] != channel {
+			t.Fatalf("gateway updates = %q, want %q", updates, want)
+		}
+	}
+	if s.VoiceConnections["guild"] != current {
+		t.Fatal("abandoned dial removed the replacement connection")
 	}
 }
 

@@ -502,7 +502,7 @@ func (v *VoiceConnection) websocket(ctx context.Context, endpoint string, token 
 		// The dial must stop with its attempt: a handshake that outlives a
 		// kill or a superseding voice server update would go on to identify
 		// on behalf of work nobody wants any more.
-		wsConn, _, err := v.session.Dialer.DialContext(ctx, vg, nil)
+		wsConn, err := dialVoiceWebsocket(ctx, v.session.Dialer, vg)
 		if err == nil && ctx.Err() != nil {
 			_ = wsConn.Close()
 			return
