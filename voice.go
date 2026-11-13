@@ -511,6 +511,11 @@ func (v *VoiceConnection) websocket(ctx context.Context, endpoint string, token 
 
 	v.Cond.L.Lock()
 	v.seqAck = -1
+	// This websocket starts a new voice session by identifying, and Discord
+	// requires each session to announce that it is speaking before it sends
+	// audio. Forget the announcement made on the session this one replaces
+	// (after a move or a voice server change) so the sender repeats it.
+	v.speaking = false
 	v.Cond.L.Unlock()
 
 	for i := 0; i < 100; i++ {
