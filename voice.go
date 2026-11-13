@@ -1346,8 +1346,11 @@ func (v *VoiceConnection) udpKeepAlive(ctx context.Context, udpConn *net.UDPConn
 
 		_, err = udpConn.Write(packet)
 		if err != nil {
-			v.log(LogError, "write error, %s", err)
-			return
+			if v.ready() {
+				v.log(LogError, "write error, %s", err)
+				return
+			}
+			v.log(LogDebug, "write error while the voice websocket is down, %s", err)
 		}
 
 		select {
@@ -1408,6 +1411,20 @@ func (c *opusClock) stampAhead() uint32 {
 	timestamp := c.timestamp
 	c.timestamp += c.samples
 	return timestamp
+}
+
+// ready reports whether the connection has a voice session and a websocket
+// serving it.
+//
+// A session's UDP socket and pumps outlive its websockets, so they are
+// running while a lost websocket is replaced. Whatever broke the websocket
+// can break the UDP path too. An error there is the connection's failure
+// only when the connection is ready. Otherwise the resume, or the session
+// that takes this one's place, decides what becomes of the connection.
+func (v *VoiceConnection) ready() bool {
+	v.Cond.L.Lock()
+	defer v.Cond.L.Unlock()
+	return v.Status == VoiceConnectionStatusReady
 }
 
 // opusSender will listen on the given channel and send any
@@ -1549,13 +1566,16 @@ func (v *VoiceConnection) sendOpus(
 		// Then send rtp audio packet to Discord over UDP
 		_, err := udpConn.Write(sendbuf)
 
-		if err != nil {
+		if err != nil && v.ready() {
 			v.log(LogError, "udp write failed idx=%d seq=%d timestamp=%d opus_len=%d udp_len=%d dave_active=%v: %s", i, sequence, timestamp, len(recvbuf), len(sendbuf), daveActive, err)
 			err := fmt.Errorf("udp write error, %w", err)
 			v.failure(ctx, err)
 			return
 		}
-		if sampleLog {
+		if err != nil {
+			// The frame is lost, as it would be on the way.
+			v.log(LogDebug, "udp write failed while the voice websocket is down idx=%d seq=%d: %s", i, sequence, err)
+		} else if sampleLog {
 			v.log(LogDebug, "udp write ok idx=%d seq=%d timestamp=%d opus_len=%d udp_len=%d dave_active=%v", i, sequence, timestamp, len(recvbuf), len(sendbuf), daveActive)
 		}
 
@@ -1599,10 +1619,21 @@ func (v *VoiceConnection) opusReceiver(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			default:
+			}
+			if v.ready() {
 				err := fmt.Errorf("udp read error, %w", err)
 				v.failure(ctx, err)
 				return
 			}
+			// Read again, a frame's time later in case the error is one
+			// that every read returns.
+			v.log(LogDebug, "udp read failed while the voice websocket is down, %s", err)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(20 * time.Millisecond):
+			}
+			continue
 		}
 
 		select {

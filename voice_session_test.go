@@ -820,3 +820,70 @@ func TestKilledVoiceConnectionEndsItsSession(t *testing.T) {
 		t.Fatal("killed connection kept its websocket")
 	}
 }
+
+// A session's UDP socket and pumps are running while its lost websocket is
+// replaced, and whatever broke the websocket can break the UDP path too. The
+// resume decides what becomes of the session then, not the pumps.
+func TestVoicePumpsOutlastUDPErrorsWhileTheWebsocketIsDown(t *testing.T) {
+	s, gateway := newVoiceTestSession(t)
+	voice := newVoiceTestConnection(s)
+	t.Cleanup(voice.Kill)
+	voice.cipher = testAEAD{}
+	voice.OpusSend = make(chan []byte, opusSendQueue)
+	voice.speaking = true
+	voice.Status = VoiceConnectionStatusConnecting
+
+	// A closed socket fails every read and write.
+	server := newVoiceUDPTestServer(t, voice)
+	conn, err := net.DialUDP("udp4", nil, server.LocalAddr().(*net.UDPAddr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.Close()
+	voice.udpConn = conn
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ticks := make(chan time.Time)
+	senderDone, receiverDone := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(senderDone)
+		voice.sendOpus(ctx, conn, opusClock{interval: 20 * time.Millisecond, samples: 960}, ticks, time.Now)
+	}()
+	go func() {
+		defer close(receiverDone)
+		voice.opusReceiver(ctx)
+	}()
+
+	for frame := byte(1); frame <= 3; frame++ {
+		if !voice.SendOpusFrame([]byte{frame}) {
+			t.Fatalf("connection refused frame %d", frame)
+		}
+		select {
+		case ticks <- time.Time{}:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("sender did not go on to frame %d", frame)
+		}
+	}
+	select {
+	case <-voice.DeadChannel():
+		t.Fatalf("a UDP error failed the connection while its websocket was down: %v", voice.Err)
+	case <-senderDone:
+		t.Fatal("sender stopped while the websocket was down")
+	case <-receiverDone:
+		t.Fatal("receiver stopped while the websocket was down")
+	case <-time.After(60 * time.Millisecond):
+	}
+
+	// With the session served again, the same errors are the connection's.
+	voice.Cond.L.Lock()
+	voice.Status = VoiceConnectionStatusReady
+	voice.Cond.L.Unlock()
+	awaitVoiceTest(t, voice.DeadChannel(), "a UDP error on a ready connection to fail it")
+	if voice.Err == nil || !strings.Contains(voice.Err.Error(), "udp read error") {
+		t.Fatalf("connection error = %v, want the UDP read error", voice.Err)
+	}
+	if leaves := gateway.leaves(t, s); leaves != 1 {
+		t.Fatalf("failed connection sent %d gateway leaves, want 1", leaves)
+	}
+}
