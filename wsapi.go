@@ -85,6 +85,14 @@ func (s *Session) openLocked(ctx context.Context) (err error) {
 	if err = ctx.Err(); err != nil {
 		return err
 	}
+	// Whoever retries a failed handshake needs to tell a gateway that had the
+	// resume and did not accept it from one that could not be reached.
+	resumeSent := false
+	defer func() {
+		if err != nil && resumeSent {
+			err = &resumeRefusedError{err}
+		}
+	}()
 	defer func() {
 		var request *gatewayReconnectError
 		if errors.As(err, &request) && !request.resumable {
@@ -205,6 +213,7 @@ func (s *Session) openLocked(ctx context.Context) (err error) {
 			err = fmt.Errorf("error sending gateway resume packet, %s, %s", s.gateway, err)
 			return err
 		}
+		resumeSent = true
 
 	}
 
@@ -961,6 +970,16 @@ func (s *Session) identify(ctx context.Context) error {
 
 const maxResumeAttempts = 3
 
+// resumeRefusedError is a gateway handshake that failed after the gateway had
+// our resume: it turned the session down, or did not answer.
+type resumeRefusedError struct {
+	err error
+}
+
+func (e *resumeRefusedError) Error() string { return e.err.Error() }
+
+func (e *resumeRefusedError) Unwrap() error { return e.err }
+
 func (s *Session) discardResumeState() {
 	s.resumeGatewayURL = ""
 	s.sessionID = ""
@@ -992,7 +1011,7 @@ func (s *Session) reconnect(ctx context.Context) {
 		return
 	}
 	wait := time.Second
-	failures := 0
+	refused, unreachable := 0, 0
 	for {
 		s.Lock()
 		if ctx.Err() != nil || s.gatewayContext != ctx || !s.ShouldReconnectOnError {
@@ -1000,11 +1019,30 @@ func (s *Session) reconnect(ctx context.Context) {
 			return
 		}
 		err := s.openLocked(ctx)
-		if err != nil && !errors.Is(err, ErrWSAlreadyOpen) {
-			failures++
-			if failures >= maxResumeAttempts && s.sessionID != "" {
-				s.log(LogWarning, "discarding resume information after %d failed reconnects, next attempt will identify", failures)
+		var refusal *resumeRefusedError
+		switch {
+		case err == nil || errors.Is(err, ErrWSAlreadyOpen):
+		case errors.As(err, &refusal):
+			// The gateway had our resume and did not accept it. A gateway may
+			// keep turning down a session that it calls resumable, so the
+			// session is given up for a new one after a few tries.
+			refused++
+			if refused >= maxResumeAttempts && s.sessionID != "" {
+				s.log(LogWarning, "discarding resume information after %d failed resumes, next attempt will identify", refused)
 				s.discardResumeState()
+			}
+		default:
+			// The gateway could not be reached, which says nothing about the
+			// session. The session is kept, because a new one has Discord end
+			// the voice connections that belong to this one, and a gateway
+			// that has let the session go says so when it is resumed. Only
+			// the address to resume at is given up, in case that is what
+			// cannot be reached: the gateway Discord advertises will either
+			// take the resume or say that the session is gone.
+			unreachable++
+			if unreachable >= maxResumeAttempts && s.resumeGatewayURL != "" {
+				s.log(LogWarning, "gateway unreachable %d times, next attempt will resume at the advertised gateway", unreachable)
+				s.resumeGatewayURL = ""
 			}
 		}
 		s.Unlock()

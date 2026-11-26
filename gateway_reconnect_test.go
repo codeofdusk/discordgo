@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"net/http"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -205,6 +207,94 @@ func TestGatewayControlPacketDuringHandshake(t *testing.T) {
 				t.Fatal("invalid session retained its resume information")
 			}
 		})
+	}
+}
+
+// A gateway that cannot be reached has not turned the session down, so the
+// session is still there to resume once the gateway can be reached again.
+// Giving it up for a new one has Discord end the voice connections that
+// belong to it.
+func TestGatewayReconnectResumesOnceTheGatewayCanBeReached(t *testing.T) {
+	operations := make(chan int, 8)
+	s := newGatewayTestSession(t, func(connection *websocket.Conn) {
+		if err := sendGatewayHello(connection); err != nil {
+			return
+		}
+		_, data, err := connection.ReadMessage()
+		if err != nil {
+			return
+		}
+		var packet struct {
+			Operation int `json:"op"`
+		}
+		if err := json.Unmarshal(data, &packet); err != nil {
+			return
+		}
+		operations <- packet.Operation
+		if packet.Operation == 6 {
+			err = connection.WriteMessage(websocket.TextMessage, []byte(`{"op":0,"t":"RESUMED","s":43,"d":{}}`))
+		} else {
+			err = sendGatewayReady(connection)
+		}
+		if err != nil {
+			return
+		}
+		for {
+			if _, _, err := connection.ReadMessage(); err != nil {
+				return
+			}
+		}
+	})
+	gateway := s.gateway
+	var dials atomic.Int32
+	dialer := *s.Dialer
+	dialer.NetDialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		if dials.Add(1) <= maxResumeAttempts {
+			return nil, errors.New("test gateway unreachable")
+		}
+		return (&net.Dialer{}).DialContext(ctx, network, address)
+	}
+	s.Dialer = &dialer
+	// A failed dial forgets the gateway's address, which is then asked for.
+	s.Client.Transport = gatewayTestTransport(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"url":"` + gateway + `"}`)),
+			Request:    req,
+		}, nil
+	})
+	s.ShouldReconnectOnError = true
+	s.sessionID = "live session"
+	s.resumeGatewayURL = gateway
+	atomic.StoreInt64(s.sequence, 42)
+	s.gatewayContext, s.gatewayCancel = context.WithCancel(context.Background())
+	defer s.gatewayCancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.reconnect(s.gatewayContext)
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	defer cancel()
+	select {
+	case operation := <-operations:
+		if operation != 6 {
+			t.Fatalf("authentication opcode after %d failed dials = %d, want 6 (resume)", maxResumeAttempts, operation)
+		}
+	case <-ctx.Done():
+		t.Fatal("reconnect did not authenticate once the gateway could be reached")
+	}
+	select {
+	case <-done:
+	case <-ctx.Done():
+		t.Fatal("reconnect did not finish once the session was resumed")
+	}
+	s.RLock()
+	resumed := s.wsConn != nil && s.sessionID == "live session"
+	s.RUnlock()
+	if !resumed {
+		t.Fatal("the session that was resumed is not the session's own")
 	}
 }
 
