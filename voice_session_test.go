@@ -570,7 +570,7 @@ func TestVoiceSessionTurnedDownWithoutVoiceServerUpdateKillsConnection(t *testin
 		t.Fatalf("connection error = %v, want close code 4006", voice.Err)
 	}
 	awaitNoVoiceWebsocket(t, server, "after the voice server turned its session down")
-	if leaves := gateway.leaves(t, voice.session); leaves != 1 {
+	if leaves := gateway.leavesAfterDeath(t, voice.session); leaves != 1 {
 		t.Fatalf("failed connection sent %d gateway leaves, want 1", leaves)
 	}
 }
@@ -592,7 +592,7 @@ func TestVoiceServerThatEndsEverySessionKillsConnection(t *testing.T) {
 		t.Fatalf("connection error = %v, want close code 4006", voice.Err)
 	}
 	awaitNoVoiceWebsocket(t, server, "beyond its limit of sessions")
-	if leaves := gateway.leaves(t, voice.session); leaves != 1 {
+	if leaves := gateway.leavesAfterDeath(t, voice.session); leaves != 1 {
 		t.Fatalf("failed connection sent %d gateway leaves, want 1", leaves)
 	}
 }
@@ -883,7 +883,7 @@ func TestVoicePumpsOutlastUDPErrorsWhileTheWebsocketIsDown(t *testing.T) {
 	if voice.Err == nil || !strings.Contains(voice.Err.Error(), "udp read error") {
 		t.Fatalf("connection error = %v, want the UDP read error", voice.Err)
 	}
-	if leaves := gateway.leaves(t, s); leaves != 1 {
+	if leaves := gateway.leavesAfterDeath(t, s); leaves != 1 {
 		t.Fatalf("failed connection sent %d gateway leaves, want 1", leaves)
 	}
 }

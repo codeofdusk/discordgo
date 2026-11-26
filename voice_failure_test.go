@@ -77,6 +77,16 @@ func (g *voiceTestGateway) leaves(t *testing.T, s *Session) int {
 	return count
 }
 
+// leavesAfterDeath is leaves for a connection that has just been seen to die
+// of a failure. Such a connection asks to leave once it is dead, so its leave
+// may still be on the way, and counting at once would let the count's own
+// marker reach the gateway first.
+func (g *voiceTestGateway) leavesAfterDeath(t *testing.T, s *Session) int {
+	t.Helper()
+	g.waitFor(t, "")
+	return g.leaves(t, s)
+}
+
 func newVoiceTestSession(t *testing.T) (*Session, *voiceTestGateway) {
 	t.Helper()
 	gateway := &voiceTestGateway{changed: make(chan struct{}, 1)}
