@@ -896,6 +896,17 @@ func (v *VoiceConnection) onEvent(socket voiceSocket, binary bool, message []byt
 	}
 
 	if binary {
+		// The voice server numbers its binary messages along with the rest,
+		// in their first two bytes, and a resume is sent whatever followed
+		// the number it acknowledges. A binary message left out of that
+		// count is sent again: a Welcome handled a second time starts the
+		// frame counter over under the same key, and listeners then turn
+		// away every frame whose number they have already seen.
+		if len(message) >= 2 {
+			v.Cond.L.Lock()
+			v.seqAck = int(message[0])<<8 | int(message[1])
+			v.Cond.L.Unlock()
+		}
 		v.handleDAVEBinary(message)
 		return
 	} else {

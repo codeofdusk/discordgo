@@ -303,6 +303,37 @@ func sendVoiceTestFrame(t *testing.T, server *voiceTestServer, voice *VoiceConne
 	return server.packet()
 }
 
+// The voice server numbers its binary messages along with the rest, and a
+// resume is sent whatever followed the number it acknowledges. Acknowledging
+// only the messages that came as JSON would have the binary ones that came
+// after them sent a second time.
+func TestVoiceResumeAcknowledgesBinaryMessages(t *testing.T) {
+	setVoiceSocketRetryDelay(t, time.Hour)
+	server, voice, _ := newVoiceSessionTest(t)
+	first := server.accept()
+	server.setUp(first, 1)
+	awaitVoiceReady(t, voice)
+
+	// Message 2 is binary: its number, then an opcode the connection has
+	// nothing to do for.
+	if err := first.conn.WriteMessage(websocket.BinaryMessage, []byte{0, 2, 27}); err != nil {
+		t.Fatal(err)
+	}
+	awaitVoiceSeqAck(t, voice, 2)
+
+	first.drop()
+	second := server.accept()
+	var resume struct {
+		SeqAck int `json:"seq_ack"`
+	}
+	if err := json.Unmarshal(second.expect(7), &resume); err != nil {
+		t.Fatal(err)
+	}
+	if resume.SeqAck != 2 {
+		t.Fatalf("resume acknowledged message %d, want the binary message 2", resume.SeqAck)
+	}
+}
+
 // A voice websocket that breaks off leaves its session in place on the voice
 // server. Resuming on a new websocket keeps everything the session
 // negotiated. The resume used to open a new UDP socket and select the
