@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -295,6 +296,82 @@ func TestGatewayReconnectResumesOnceTheGatewayCanBeReached(t *testing.T) {
 	s.RUnlock()
 	if !resumed {
 		t.Fatal("the session that was resumed is not the session's own")
+	}
+}
+
+// Discord invalidates the session of a client that closes its connection
+// with 1000 or 1001. A connection that is given up so that its session can be
+// resumed on another has to be closed with some other code, or there is
+// nothing left to resume.
+func TestGatewayConnectionGivenUpLeavesItsSessionResumable(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		// interval is the heartbeat interval the gateway asks for.
+		interval int
+		// lose has the gateway make the client give the connection up.
+		lose func(connection *websocket.Conn) error
+	}{
+		{
+			name:     "closed by the gateway",
+			interval: 1000,
+			lose: func(connection *websocket.Conn) error {
+				return connection.WriteControl(
+					websocket.CloseMessage,
+					websocket.FormatCloseMessage(4000, ""),
+					time.Now().Add(time.Second),
+				)
+			},
+		},
+		{
+			// The gateway never acknowledges a heartbeat.
+			name:     "heartbeats unacknowledged",
+			interval: 10,
+			lose:     func(*websocket.Conn) error { return nil },
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			closed := make(chan int, 1)
+			s := newGatewayTestSession(t, func(connection *websocket.Conn) {
+				hello := fmt.Sprintf(`{"op":10,"d":{"heartbeat_interval":%d}}`, test.interval)
+				if err := connection.WriteMessage(websocket.TextMessage, []byte(hello)); err != nil {
+					return
+				}
+				if _, _, err := connection.ReadMessage(); err != nil {
+					return
+				}
+				if err := sendGatewayReady(connection); err != nil {
+					return
+				}
+				if err := test.lose(connection); err != nil {
+					return
+				}
+				for {
+					if _, _, err := connection.ReadMessage(); err != nil {
+						code := -1
+						var closure *websocket.CloseError
+						if errors.As(err, &closure) {
+							code = closure.Code
+						}
+						closed <- code
+						return
+					}
+				}
+			})
+			if err := s.Open(); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case code := <-closed:
+				if code < 0 {
+					t.Fatal("the connection was dropped without a close frame")
+				}
+				if code == websocket.CloseNormalClosure || code == websocket.CloseGoingAway {
+					t.Fatalf("connection closed with %d, which invalidates the session it is to resume", code)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("the client did not give the connection up")
+			}
+		})
 	}
 }
 

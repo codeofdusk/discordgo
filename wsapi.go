@@ -315,7 +315,7 @@ func (s *Session) listen(wsConn *websocket.Conn, listening <-chan interface{}, r
 
 		if err != nil {
 
-			s.reconnectConnection(wsConn, websocket.CloseNormalClosure, false)
+			s.reconnectConnection(wsConn, gatewayResumeCloseCode, false)
 			return
 		}
 
@@ -328,7 +328,7 @@ func (s *Session) listen(wsConn *websocket.Conn, listening <-chan interface{}, r
 			_, err := s.onEvent(messageType, message)
 			var request *gatewayReconnectError
 			if errors.As(err, &request) {
-				s.reconnectConnection(wsConn, websocket.CloseServiceRestart, !request.resumable)
+				s.reconnectConnection(wsConn, gatewayResumeCloseCode, !request.resumable)
 				return
 			}
 
@@ -388,7 +388,7 @@ func (s *Session) heartbeat(wsConn *websocket.Conn, listening <-chan interface{}
 			} else {
 				s.log(LogError, "haven't gotten a heartbeat ACK in %v, triggering a reconnection", time.Now().UTC().Sub(last))
 			}
-			s.reconnectConnection(wsConn, websocket.CloseNormalClosure, false)
+			s.reconnectConnection(wsConn, gatewayResumeCloseCode, false)
 			return
 		}
 		s.Lock()
@@ -969,6 +969,13 @@ func (s *Session) identify(ctx context.Context) error {
 }
 
 const maxResumeAttempts = 3
+
+// gatewayResumeCloseCode closes a gateway connection whose session is about
+// to be resumed on another. Discord invalidates the session of a client that
+// closes with 1000 or 1001, and keeps it for a client that closes with any
+// other code. An invalidated session cannot be resumed, and the voice
+// connections that belong to it end with it.
+const gatewayResumeCloseCode = websocket.CloseServiceRestart
 
 // resumeRefusedError is a gateway handshake that failed after the gateway had
 // our resume: it turned the session down, or did not answer.
